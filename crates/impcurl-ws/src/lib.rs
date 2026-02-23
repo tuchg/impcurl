@@ -2,15 +2,12 @@ use anyhow::{Context, Result, bail};
 use impcurl::{
     MultiSession, WebSocketConnectConfig, WsFrameAssembler,
     complete_connect_only_websocket_handshake_with_multi, detach_easy_from_multi,
-    ensure_curl_global_init, prepare_connect_only_websocket_session, ws_try_recv_frame,
+    ensure_curl_global_init, prepare_connect_only_websocket_session, ws_send_text,
+    ws_try_recv_frame,
 };
-#[cfg(unix)]
-use impcurl::ws_send_text_async;
-#[cfg(not(unix))]
-use impcurl::ws_send_text;
 use impcurl_sys::{
     CURL_CSELECT_ERR, CURL_CSELECT_IN, CURL_CSELECT_OUT, CURL_POLL_IN, CURL_POLL_INOUT,
-    CURL_POLL_OUT, CURL_POLL_REMOVE, Curl, CurlApi, CurlSocket,
+    CURL_POLL_OUT, CURL_POLL_REMOVE, CURLE_AGAIN, Curl, CurlApi, CurlSocket,
 };
 #[cfg(unix)]
 use std::collections::HashMap;
@@ -22,7 +19,6 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::Mutex;
 use std::time::Duration;
-use tracing::{debug, info, warn};
 #[cfg(unix)]
 use tokio::io::Interest;
 #[cfg(unix)]
@@ -34,45 +30,45 @@ use tokio::time::sleep;
 #[cfg(unix)]
 use tokio::time::timeout as timeout_async;
 use tokio::time::timeout;
+use tracing::{debug, info, warn};
 
 #[derive(Debug)]
-pub enum WorkerCommand {
+enum WorkerCommand {
     SendText(String),
     Shutdown,
 }
 
 #[derive(Debug)]
-pub enum WorkerEvent {
+enum WorkerEvent {
     Connected,
-    Frame { flags: i32, payload: Vec<u8> },
+    Frame { payload: Vec<u8> },
     Error(String),
     Shutdown,
 }
 
-
 #[derive(Clone, Debug)]
-pub struct WsClientConfig {
-    pub lib_path: Option<PathBuf>,
-    pub url: String,
-    pub origin: Option<String>,
-    pub user_agent: Option<String>,
-    pub impersonate_target: String,
-    pub verbose: bool,
-    pub connect_timeout: Duration,
-    pub multi_poll_timeout: Duration,
-    pub send_again_sleep: Duration,
-    pub loop_sleep: Duration,
-    pub event_channel_capacity: usize,
+struct WsClientConfig {
+    lib_path: Option<PathBuf>,
+    url: String,
+    origin: Option<String>,
+    user_agent: Option<String>,
+    impersonate_target: impcurl::ImpersonateTarget,
+    verbose: bool,
+    connect_timeout: Duration,
+    multi_poll_timeout: Duration,
+    send_again_sleep: Duration,
+    loop_sleep: Duration,
+    event_channel_capacity: usize,
 }
 
 impl WsClientConfig {
-    pub fn new(url: impl Into<String>) -> Self {
+    fn new(url: impl Into<String>) -> Self {
         Self {
             lib_path: None,
             url: url.into(),
             origin: None,
             user_agent: None,
-            impersonate_target: "chrome136".to_owned(),
+            impersonate_target: impcurl::ImpersonateTarget::Chrome136,
             verbose: false,
             connect_timeout: Duration::from_secs(20),
             multi_poll_timeout: Duration::from_millis(500),
@@ -81,10 +77,46 @@ impl WsClientConfig {
             event_channel_capacity: 1024,
         }
     }
+}
 
-    pub fn with_lib_path(mut self, lib_path: impl Into<PathBuf>) -> Self {
-        self.lib_path = Some(lib_path.into());
+/// Builder for configuring a WebSocket connection.
+pub struct WsClientBuilder {
+    cfg: WsClientConfig,
+}
+
+impl WsClientBuilder {
+    pub fn origin(mut self, origin: impl Into<String>) -> Self {
+        self.cfg.origin = Some(origin.into());
         self
+    }
+
+    pub fn user_agent(mut self, ua: impl Into<String>) -> Self {
+        self.cfg.user_agent = Some(ua.into());
+        self
+    }
+
+    pub fn impersonate(mut self, target: impcurl::ImpersonateTarget) -> Self {
+        self.cfg.impersonate_target = target;
+        self
+    }
+
+    pub fn connect_timeout(mut self, t: Duration) -> Self {
+        self.cfg.connect_timeout = t;
+        self
+    }
+
+    pub fn lib_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.cfg.lib_path = Some(path.into());
+        self
+    }
+
+    pub fn verbose(mut self, on: bool) -> Self {
+        self.cfg.verbose = on;
+        self
+    }
+
+    pub async fn connect(self) -> Result<WsClient> {
+        WsClient::connect_inner(self.cfg).await
     }
 }
 
@@ -95,7 +127,49 @@ pub struct WsClient {
 }
 
 impl WsClient {
-    pub async fn connect(mut cfg: WsClientConfig) -> Result<Self> {
+    /// Quick connect with just a URL.
+    pub async fn connect(url: impl Into<String>) -> Result<Self> {
+        Self::connect_inner(WsClientConfig::new(url)).await
+    }
+
+    /// Returns a builder for advanced configuration.
+    pub fn builder(url: impl Into<String>) -> WsClientBuilder {
+        WsClientBuilder {
+            cfg: WsClientConfig::new(url),
+        }
+    }
+
+    /// Send a text frame.
+    pub fn send(&self, text: &str) -> Result<()> {
+        self.cmd_tx
+            .send(WorkerCommand::SendText(text.to_owned()))
+            .map_err(|_| anyhow::anyhow!("websocket closed"))
+    }
+
+    /// Receive the next text message. Returns `None` on shutdown.
+    pub async fn recv(&mut self) -> Result<Option<String>> {
+        self.recv_inner(None).await
+    }
+
+    /// Receive with a timeout. Returns `None` on shutdown or timeout.
+    pub async fn recv_timeout(&mut self, max_wait: Duration) -> Result<Option<String>> {
+        self.recv_inner(Some(max_wait)).await
+    }
+
+    pub async fn shutdown(&mut self) -> Result<()> {
+        debug!("shutting down websocket worker");
+        let _ = self.cmd_tx.send(WorkerCommand::Shutdown);
+        if let Some(worker) = self.worker.take() {
+            match worker.await {
+                Ok(()) => {}
+                Err(join_err) if join_err.is_cancelled() => {}
+                Err(join_err) => bail!("worker task failed: {join_err}"),
+            }
+        }
+        Ok(())
+    }
+
+    async fn connect_inner(mut cfg: WsClientConfig) -> Result<Self> {
         let resolved_lib = resolve_lib_path_for_connect(cfg.lib_path.clone())?;
         cfg.lib_path = Some(resolved_lib);
 
@@ -117,18 +191,16 @@ impl WsClient {
             .context("timed out waiting for websocket connect event")?;
 
         match connected {
-            Some(WorkerEvent::Connected) => {
-                info!("websocket connected");
-            }
+            Some(WorkerEvent::Connected) => info!("websocket connected"),
             Some(WorkerEvent::Error(err)) => {
                 warn!(err = %err, "worker failed before connect");
                 bail!("worker failed before websocket connected: {err}");
             }
             Some(WorkerEvent::Shutdown) | None => {
-                bail!("worker stopped before websocket connected");
+                bail!("worker stopped before websocket connected")
             }
             Some(WorkerEvent::Frame { .. }) => {
-                bail!("worker produced frame before websocket connected");
+                bail!("worker produced frame before websocket connected")
             }
         }
 
@@ -139,68 +211,21 @@ impl WsClient {
         })
     }
 
-    pub fn send_text(&self, text: String) -> Result<()> {
-        self.cmd_tx
-            .send(WorkerCommand::SendText(text))
-            .map_err(|_| anyhow::anyhow!("worker channel closed while sending"))
-    }
-
-    pub async fn recv_event(&mut self, max_wait: Duration) -> Option<WorkerEvent> {
-        timeout(max_wait, self.event_rx.recv()).await.ok().flatten()
-    }
-
-    pub async fn shutdown(&mut self) -> Result<()> {
-        debug!("shutting down websocket worker");
-        let _ = self.cmd_tx.send(WorkerCommand::Shutdown);
-        if let Some(worker) = self.worker.take() {
-            match worker.await {
-                Ok(()) => {}
-                Err(join_err) if join_err.is_cancelled() => {}
-                Err(join_err) => {
-                    bail!("worker task failed: {join_err}");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn connect_url(url: impl Into<String>) -> Result<Self> {
-        Self::connect(WsClientConfig::new(url)).await
-    }
-
-    pub async fn connect_with_browser(
-        url: impl Into<String>,
-        origin: impl Into<String>,
-        user_agent: impl Into<String>,
-    ) -> Result<Self> {
-        let mut cfg = WsClientConfig::new(url);
-        cfg.origin = Some(origin.into());
-        cfg.user_agent = Some(user_agent.into());
-        Self::connect(cfg).await
-    }
-
-    pub fn send_json(&self, value: &serde_json::Value) -> Result<()> {
-        self.send_text(value.to_string())
-    }
-
-    pub async fn next_event(&mut self, max_wait: Duration) -> Result<Option<WorkerEvent>> {
-        match self.recv_event(max_wait).await {
-            Some(WorkerEvent::Error(err)) => bail!("websocket worker error: {err}"),
-            other => Ok(other),
-        }
-    }
-
-    pub async fn next_text(&mut self, max_wait: Duration) -> Result<Option<String>> {
+    async fn recv_inner(&mut self, max_wait: Option<Duration>) -> Result<Option<String>> {
         loop {
-            match self.next_event(max_wait).await? {
-                Some(WorkerEvent::Frame { payload, .. }) => {
+            let event = match max_wait {
+                Some(d) => timeout(d, self.event_rx.recv()).await.ok().flatten(),
+                None => self.event_rx.recv().await,
+            };
+            match event {
+                Some(WorkerEvent::Frame { payload }) => {
                     let text = String::from_utf8(payload)
                         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
                     return Ok(Some(text));
                 }
+                Some(WorkerEvent::Error(err)) => bail!("websocket worker error: {err}"),
                 Some(WorkerEvent::Connected) => continue,
                 Some(WorkerEvent::Shutdown) | None => return Ok(None),
-                Some(WorkerEvent::Error(_)) => unreachable!(),
             }
         }
     }
@@ -241,11 +266,14 @@ struct AsyncFdCache {
 #[cfg(unix)]
 impl AsyncFdCache {
     fn new() -> Self {
-        Self { fds: HashMap::new() }
+        Self {
+            fds: HashMap::new(),
+        }
     }
 
     fn sync_with(&mut self, socket_events: &[(CurlSocket, c_int)]) {
-        self.fds.retain(|sock, _| socket_events.iter().any(|(s, _)| s == sock));
+        self.fds
+            .retain(|sock, _| socket_events.iter().any(|(s, _)| s == sock));
         for &(socket, ev) in socket_events {
             let Some(interest) = tokio_interest_from_curl_poll(ev) else {
                 self.fds.remove(&socket);
@@ -281,9 +309,8 @@ impl AsyncFdCache {
 
         // Multi-socket: poll each cached AsyncFd with short per-fd timeout
         // Typical case: 1-2 sockets per WS connection, so this is O(1)-O(2)
-        let per_fd = Duration::from_millis(
-            (wait.as_millis() / self.fds.len().max(1) as u128).max(1) as u64,
-        );
+        let per_fd =
+            Duration::from_millis((wait.as_millis() / self.fds.len().max(1) as u128).max(1) as u64);
         for (&socket, (async_fd, interest)) in &self.fds {
             if let Ok(Ok(mut guard)) = timeout_async(per_fd, async_fd.ready(*interest)).await {
                 let mask = ready_to_mask(&guard);
@@ -299,9 +326,15 @@ impl AsyncFdCache {
 fn ready_to_mask(guard: &tokio::io::unix::AsyncFdReadyGuard<'_, RawSocketFd>) -> c_int {
     let ready = guard.ready();
     let mut mask = 0;
-    if ready.is_readable() { mask |= CURL_CSELECT_IN; }
-    if ready.is_writable() { mask |= CURL_CSELECT_OUT; }
-    if ready.is_error() || mask == 0 { mask |= CURL_CSELECT_ERR; }
+    if ready.is_readable() {
+        mask |= CURL_CSELECT_IN;
+    }
+    if ready.is_writable() {
+        mask |= CURL_CSELECT_OUT;
+    }
+    if ready.is_error() || mask == 0 {
+        mask |= CURL_CSELECT_ERR;
+    }
     mask
 }
 
@@ -398,7 +431,11 @@ async fn drive_multi_once_with_cache(
             .lock()
             .map_err(|_| anyhow::anyhow!("curl multi callback state lock poisoned"))?;
         (
-            guard.socket_events.iter().map(|(s, e)| (*s, *e)).collect::<Vec<_>>(),
+            guard
+                .socket_events
+                .iter()
+                .map(|(s, e)| (*s, *e))
+                .collect::<Vec<_>>(),
             guard.timeout_ms,
         )
     };
@@ -413,19 +450,14 @@ async fn drive_multi_once_with_cache(
 
     let mut running_handles = 0;
 
-    if fd_cache.fds.is_empty() {
+    let action = if fd_cache.fds.is_empty() {
         if wait_ms > 0 {
             sleep(wait_duration).await;
         }
-        multi.socket_action_timeout(&mut running_handles)?;
-        if running_handles > 0 {
-            multi.perform(&mut running_handles)?;
-        }
-        return Ok(());
-    }
-
-    // Poll persistent AsyncFds — no epoll_ctl churn
-    let action = fd_cache.wait_any_ready(wait_duration).await;
+        None
+    } else {
+        fd_cache.wait_any_ready(wait_duration).await
+    };
 
     match action {
         Some((socket, mask)) => {
@@ -442,12 +474,44 @@ async fn drive_multi_once_with_cache(
     Ok(())
 }
 
+/// Returns true if shutdown requested.
+fn handle_cmd(
+    api: &CurlApi,
+    easy_handle: usize,
+    cmd: WorkerCommand,
+    pending_send: &mut Option<(Vec<u8>, usize)>,
+    event_tx: &mpsc::Sender<WorkerEvent>,
+) -> Result<bool> {
+    match cmd {
+        WorkerCommand::SendText(text) => {
+            let data = text.into_bytes();
+            match ws_send_text(api, easy_handle as *mut Curl, &data) {
+                Ok(sent) if sent >= data.len() => {}
+                Ok(sent) => {
+                    *pending_send = Some((data, sent));
+                }
+                Err(e) if matches!(&e, impcurl::ImpcurlError::Curl { code, .. } if *code == CURLE_AGAIN) =>
+                {
+                    *pending_send = Some((data, 0));
+                }
+                Err(e) => return Err(e.into()),
+            }
+            Ok(false)
+        }
+        WorkerCommand::Shutdown => {
+            debug!("worker received shutdown command");
+            let _ = event_tx.try_send(WorkerEvent::Shutdown);
+            Ok(true)
+        }
+    }
+}
+
 #[cfg(unix)]
 async fn run_worker_loop_async(
     api: &CurlApi,
     multi: &mut MultiSession<'_>,
     easy_handle: usize,
-    send_again_sleep: Duration,
+    _send_again_sleep: Duration,
     loop_poll_timeout: Duration,
     callback_state: &Mutex<MultiCallbackState>,
     mut cmd_rx: UnboundedReceiver<WorkerCommand>,
@@ -455,35 +519,74 @@ async fn run_worker_loop_async(
 ) -> Result<()> {
     let mut assembler = WsFrameAssembler::default();
     let mut fd_cache = AsyncFdCache::new();
+    let mut pending_send: Option<(Vec<u8>, usize)> = None;
+    let mut cmd_buf: Vec<WorkerCommand> = Vec::new();
     loop {
+        // recv all available frames
         while let Some(frame) = ws_try_recv_frame(api, easy_handle as *mut Curl, &mut assembler)? {
-            let _ = event_tx
+            if event_tx
                 .try_send(WorkerEvent::Frame {
-                    flags: frame.flags,
                     payload: frame.payload,
-                });
+                })
+                .is_err()
+            {
+                warn!("event channel full, frame dropped");
+            }
         }
 
-        match cmd_rx.try_recv() {
-            Ok(WorkerCommand::SendText(text)) => {
-                ws_send_text_async(api, easy_handle, &text, send_again_sleep)
-                    .await
-                    .with_context(|| format!("failed to send websocket text: {text}"))?;
+        // resume pending send
+        if let Some((ref data, ref mut offset)) = pending_send {
+            match ws_send_text(api, easy_handle as *mut Curl, &data[*offset..]) {
+                Ok(sent) => {
+                    *offset += sent;
+                    if *offset >= data.len() {
+                        pending_send = None;
+                    }
+                }
+                Err(e) if matches!(&e, impcurl::ImpcurlError::Curl { code, .. } if *code == CURLE_AGAIN) =>
+                    {}
+                Err(e) => return Err(e.into()),
             }
-            Ok(WorkerCommand::Shutdown) => {
-                debug!("worker received shutdown command");
-                let _ = event_tx.try_send(WorkerEvent::Shutdown);
-                return Ok(());
-            }
-            Err(TryRecvError::Disconnected) => {
-                debug!("worker command channel disconnected");
-                let _ = event_tx.try_send(WorkerEvent::Shutdown);
-                return Ok(());
-            }
-            Err(TryRecvError::Empty) => {}
         }
 
-        drive_multi_once_with_cache(multi, callback_state, &mut fd_cache, loop_poll_timeout).await?;
+        // process buffered commands from select!, then drain channel
+        for cmd in cmd_buf.drain(..) {
+            if handle_cmd(api, easy_handle, cmd, &mut pending_send, &event_tx)? {
+                return Ok(());
+            }
+        }
+        loop {
+            match cmd_rx.try_recv() {
+                Ok(cmd) => {
+                    if handle_cmd(api, easy_handle, cmd, &mut pending_send, &event_tx)? {
+                        return Ok(());
+                    }
+                }
+                Err(TryRecvError::Disconnected) => {
+                    debug!("worker command channel disconnected");
+                    let _ = event_tx.try_send(WorkerEvent::Shutdown);
+                    return Ok(());
+                }
+                Err(TryRecvError::Empty) => break,
+            }
+        }
+
+        // wait for socket ready OR command arrival
+        tokio::select! {
+            biased;
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(c) => cmd_buf.push(c),
+                    None => {
+                        let _ = event_tx.try_send(WorkerEvent::Shutdown);
+                        return Ok(());
+                    }
+                }
+            }
+            result = drive_multi_once_with_cache(multi, callback_state, &mut fd_cache, loop_poll_timeout) => {
+                result?;
+            }
+        }
     }
 }
 
@@ -492,37 +595,52 @@ fn run_worker_loop(
     api: &CurlApi,
     multi: &mut MultiSession<'_>,
     easy_handle: usize,
-    send_again_sleep: Duration,
+    _send_again_sleep: Duration,
     loop_poll_timeout: Duration,
     mut cmd_rx: UnboundedReceiver<WorkerCommand>,
     event_tx: mpsc::Sender<WorkerEvent>,
 ) -> Result<()> {
     let mut assembler = WsFrameAssembler::default();
+    let mut pending_send: Option<(Vec<u8>, usize)> = None;
     loop {
         while let Some(frame) = ws_try_recv_frame(api, easy_handle as *mut Curl, &mut assembler)? {
-            let _ = event_tx
+            if event_tx
                 .try_send(WorkerEvent::Frame {
-                    flags: frame.flags,
                     payload: frame.payload,
-                });
+                })
+                .is_err()
+            {
+                warn!("event channel full, frame dropped");
+            }
         }
 
-        match cmd_rx.try_recv() {
-            Ok(WorkerCommand::SendText(text)) => {
-                ws_send_text(api, easy_handle as *mut Curl, &text, send_again_sleep)
-                    .with_context(|| format!("failed to send websocket text: {text}"))?;
+        if let Some((ref data, ref mut offset)) = pending_send {
+            match ws_send_text(api, easy_handle as *mut Curl, &data[*offset..]) {
+                Ok(sent) => {
+                    *offset += sent;
+                    if *offset >= data.len() {
+                        pending_send = None;
+                    }
+                }
+                Err(impcurl::ImpcurlError::Curl { code, .. }) if code == CURLE_AGAIN => {}
+                Err(e) => return Err(e.into()),
             }
-            Ok(WorkerCommand::Shutdown) => {
-                debug!("worker received shutdown command");
-                let _ = event_tx.try_send(WorkerEvent::Shutdown);
-                return Ok(());
+        }
+
+        loop {
+            match cmd_rx.try_recv() {
+                Ok(cmd) => {
+                    if handle_cmd(api, easy_handle, cmd, &mut pending_send, &event_tx)? {
+                        return Ok(());
+                    }
+                }
+                Err(TryRecvError::Disconnected) => {
+                    debug!("worker command channel disconnected");
+                    let _ = event_tx.try_send(WorkerEvent::Shutdown);
+                    return Ok(());
+                }
+                Err(TryRecvError::Empty) => break,
             }
-            Err(TryRecvError::Disconnected) => {
-                debug!("worker command channel disconnected");
-                let _ = event_tx.try_send(WorkerEvent::Shutdown);
-                return Ok(());
-            }
-            Err(TryRecvError::Empty) => {}
         }
 
         drive_multi_once_poll_fallback(multi, loop_poll_timeout)?;
@@ -559,7 +677,7 @@ async fn run_worker(
         url: &cfg.url,
         origin: cfg.origin.as_deref(),
         user_agent: cfg.user_agent.as_deref(),
-        impersonate_target: &cfg.impersonate_target,
+        impersonate_target: cfg.impersonate_target,
         verbose: cfg.verbose,
     };
     let session = prepare_connect_only_websocket_session(&api, &connect_cfg)?;

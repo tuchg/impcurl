@@ -10,7 +10,6 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_long, c_void};
 use std::ptr;
 use std::sync::OnceLock;
-use std::thread;
 use std::time::Duration;
 use tracing::{debug, trace};
 
@@ -267,11 +266,106 @@ impl<'a> MultiSession<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImpersonateTarget {
+    Chrome99,
+    Chrome100,
+    Chrome101,
+    Chrome104,
+    Chrome107,
+    Chrome110,
+    Chrome116,
+    Chrome119,
+    Chrome120,
+    Chrome123,
+    Chrome124,
+    Chrome131,
+    Chrome133a,
+    Chrome136,
+    Chrome142,
+    Chrome99Android,
+    Chrome131Android,
+    Chrome,
+    ChromeAndroid,
+    Edge99,
+    Edge101,
+    Edge,
+    Safari153,
+    Safari155,
+    Safari170,
+    Safari180,
+    Safari184,
+    Safari260,
+    Safari2601,
+    Safari,
+    SafariBeta,
+    Safari172Ios,
+    Safari180Ios,
+    Safari184Ios,
+    Safari260Ios,
+    SafariIos,
+    SafariIosBeta,
+    Firefox133,
+    Firefox135,
+    Firefox144,
+    Firefox,
+    Tor145,
+}
+
+impl ImpersonateTarget {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Chrome99 => "chrome99",
+            Self::Chrome100 => "chrome100",
+            Self::Chrome101 => "chrome101",
+            Self::Chrome104 => "chrome104",
+            Self::Chrome107 => "chrome107",
+            Self::Chrome110 => "chrome110",
+            Self::Chrome116 => "chrome116",
+            Self::Chrome119 => "chrome119",
+            Self::Chrome120 => "chrome120",
+            Self::Chrome123 => "chrome123",
+            Self::Chrome124 => "chrome124",
+            Self::Chrome131 => "chrome131",
+            Self::Chrome133a => "chrome133a",
+            Self::Chrome136 => "chrome136",
+            Self::Chrome142 => "chrome142",
+            Self::Chrome99Android => "chrome99_android",
+            Self::Chrome131Android => "chrome131_android",
+            Self::Chrome => "chrome",
+            Self::ChromeAndroid => "chrome_android",
+            Self::Edge99 => "edge99",
+            Self::Edge101 => "edge101",
+            Self::Edge => "edge",
+            Self::Safari153 => "safari153",
+            Self::Safari155 => "safari155",
+            Self::Safari170 => "safari170",
+            Self::Safari180 => "safari180",
+            Self::Safari184 => "safari184",
+            Self::Safari260 => "safari260",
+            Self::Safari2601 => "safari2601",
+            Self::Safari => "safari",
+            Self::SafariBeta => "safari_beta",
+            Self::Safari172Ios => "safari172_ios",
+            Self::Safari180Ios => "safari180_ios",
+            Self::Safari184Ios => "safari184_ios",
+            Self::Safari260Ios => "safari260_ios",
+            Self::SafariIos => "safari_ios",
+            Self::SafariIosBeta => "safari_ios_beta",
+            Self::Firefox133 => "firefox133",
+            Self::Firefox135 => "firefox135",
+            Self::Firefox144 => "firefox144",
+            Self::Firefox => "firefox",
+            Self::Tor145 => "tor145",
+        }
+    }
+}
+
 pub struct WebSocketConnectConfig<'a> {
     pub url: &'a str,
     pub origin: Option<&'a str>,
     pub user_agent: Option<&'a str>,
-    pub impersonate_target: &'a str,
+    pub impersonate_target: ImpersonateTarget,
     pub verbose: bool,
 }
 
@@ -281,7 +375,7 @@ fn configure_connect_only_websocket_session(
 ) -> Result<()> {
     {
         let api = session.api();
-        let c_target = CString::new(cfg.impersonate_target)?;
+        let c_target = CString::new(cfg.impersonate_target.as_str())?;
         let impersonate_code =
             unsafe { (api.easy_impersonate)(session.easy_handle(), c_target.as_ptr(), 1) };
         check_code(api, impersonate_code, "curl_easy_impersonate")?;
@@ -348,7 +442,7 @@ pub fn prepare_connect_only_websocket_session<'a>(
     api: &'a CurlApi,
     cfg: &WebSocketConnectConfig<'_>,
 ) -> Result<EasySession<'a>> {
-    debug!(url = cfg.url, impersonate = cfg.impersonate_target, "preparing websocket session");
+    debug!(url = cfg.url, impersonate = cfg.impersonate_target.as_str(), "preparing websocket session");
     let mut session = EasySession::new(api)?;
     configure_connect_only_websocket_session(&mut session, cfg)?;
     Ok(session)
@@ -388,23 +482,6 @@ pub fn complete_connect_only_websocket_handshake_with_multi(
 
 pub fn detach_easy_from_multi(multi: &MultiSession<'_>, easy: *mut Curl) -> Result<()> {
     multi.remove_easy(easy)
-}
-
-pub fn open_connect_only_websocket_session<'a>(
-    api: &'a CurlApi,
-    cfg: &WebSocketConnectConfig<'_>,
-) -> Result<EasySession<'a>> {
-    let session = prepare_connect_only_websocket_session(api, cfg)?;
-    let multi = MultiSession::new(api)?;
-    complete_connect_only_websocket_handshake_with_multi(
-        api,
-        &multi,
-        session.easy_handle(),
-        Duration::from_millis(500),
-    )?;
-    detach_easy_from_multi(&multi, session.easy_handle())?;
-
-    Ok(session)
 }
 
 pub fn check_code(api: &CurlApi, code: CurlCode, step: &str) -> Result<()> {
@@ -549,77 +626,8 @@ pub fn ws_try_recv_frame(
     }
 }
 
-pub fn ws_send_text(
-    api: &CurlApi,
-    easy: *mut Curl,
-    text: &str,
-    again_sleep: Duration,
-) -> Result<()> {
-    let payload = text.as_bytes();
-    let mut offset = 0usize;
-
-    while offset < payload.len() {
-        let mut sent = 0usize;
-        let code = unsafe {
-            (api.ws_send)(
-                easy,
-                payload[offset..].as_ptr().cast(),
-                payload.len() - offset,
-                &mut sent,
-                0,
-                CURLWS_TEXT,
-            )
-        };
-
-        if code == CURLE_OK {
-            if sent == 0 {
-                return Err(ImpcurlError::SendZeroBytes);
-            }
-            offset += sent;
-            continue;
-        }
-
-        if code == CURLE_AGAIN {
-            thread::sleep(again_sleep);
-            continue;
-        }
-
-        return Err(ImpcurlError::Curl {
-            step: "curl_ws_send".to_owned(),
-            message: api.error_text(code),
-            code,
-        });
-    }
-
-    Ok(())
-}
-
-pub async fn ws_send_text_async(
-    api: &CurlApi,
-    easy_handle: usize,
-    text: &str,
-    again_sleep: Duration,
-) -> Result<()> {
-    let payload = text.as_bytes();
-    let mut offset = 0usize;
-
-    while offset < payload.len() {
-        let result = ws_send_once(api, easy_handle as *mut Curl, &payload[offset..]);
-        match result {
-            Ok(sent) => {
-                offset += sent;
-            }
-            Err(ImpcurlError::Curl { code, .. }) if code == CURLE_AGAIN => {
-                tokio::time::sleep(again_sleep).await;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    Ok(())
-}
-
-fn ws_send_once(api: &CurlApi, easy: *mut Curl, data: &[u8]) -> Result<usize> {
+/// Single-attempt ws_send. Returns bytes sent, or CURLE_AGAIN error if socket not ready.
+pub fn ws_send_text(api: &CurlApi, easy: *mut Curl, data: &[u8]) -> Result<usize> {
     let mut sent = 0usize;
     let code = unsafe {
         (api.ws_send)(

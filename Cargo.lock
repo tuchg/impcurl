@@ -109,7 +109,6 @@ version = "0.1.0"
 dependencies = [
  "impcurl-sys",
  "thiserror",
- "tokio",
  "tracing",
 ]
 
