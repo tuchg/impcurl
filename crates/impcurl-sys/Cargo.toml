@@ -1,8 +1,14 @@
 [package]
 name = "impcurl-sys"
+description = "Dynamic FFI bindings for libcurl-impersonate with auto-fetch support"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+keywords = ["curl", "impersonate", "ffi", "tls", "fingerprint"]
+categories = ["external-ffi-bindings", "web-programming"]
 
 [dependencies]
 libloading.workspace = true

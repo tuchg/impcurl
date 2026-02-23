@@ -1,93 +1,90 @@
-# impcurl workspace
+# impcurl
 
-Rust workspace for `libcurl-impersonate` WebSocket wrapping and GMGN smoke testing.
+Rust WebSocket client with TLS fingerprint impersonation, powered by [libcurl-impersonate](https://github.com/lexiforest/curl-impersonate).
+
+Bypass TLS fingerprinting by impersonating real browser signatures (Chrome, Safari, Firefox, Edge, Tor).
 
 ## Crates
 
-- `impcurl-sys`: dynamic loading + raw FFI bindings for `libcurl-impersonate`
-- `impcurl`: safe blocking wrapper for websocket handshake/send/recv
-- `impcurl-ws`: tokio bridge (`worker thread + channels`) and GMGN smoke example
+| Crate | Description |
+|-------|-------------|
+| `impcurl-sys` | Dynamic FFI bindings for `libcurl-impersonate` with auto-fetch |
+| `impcurl` | Safe blocking wrapper — WebSocket handshake, send, recv |
+| `impcurl-ws` | Async tokio client with builder API |
 
-The WebSocket handshake path uses `curl_multi_*` (`multi_poll` + `multi_socket_action` + `multi_perform`) instead of direct `curl_easy_perform`.
-At runtime, Unix builds use `CURLMOPT_SOCKETFUNCTION`/`CURLMOPT_TIMERFUNCTION` to maintain socket/timer interests and dispatch readiness via `tokio::io::unix::AsyncFd` + `socket_action(fd, mask)`, with `multi_perform` only as fallback.
+## Quick Start
 
-## Build
-
-```bash
-cargo build -p impcurl-ws --example 
+```toml
+[dependencies]
+impcurl-ws = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-## Run smoke test
+```rust
+use impcurl_ws::WsClient;
 
-```bash
-CURL_IMPERSONATE_LIB=/abs/path/libcurl-impersonate.4.dylib cargo run -p impcurl-ws --example 
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let mut ws = WsClient::connect("wss://echo.websocket.org").await?;
+
+    ws.send_text("hello")?;
+
+    if let Some(data) = ws.recv_timeout(std::time::Duration::from_secs(5)).await? {
+        println!("{}", String::from_utf8_lossy(&data));
+    }
+
+    ws.shutdown().await
+}
 ```
 
-Tokio-friendly minimal API example:
+## Builder API
 
-```bash
-cargo run -p impcurl-ws --example 
+```rust
+use impcurl::ImpersonateTarget;
+use impcurl_ws::WsClient;
+use std::time::Duration;
+
+let mut ws = WsClient::builder("wss://example.com/ws")
+    .header("Origin", "https://example.com")
+    .header("User-Agent", "Mozilla/5.0 ...")
+    .proxy("socks5h://127.0.0.1:1080")
+    .impersonate(ImpersonateTarget::Chrome136)
+    .connect_timeout(Duration::from_secs(10))
+    .verbose(true)
+    .connect()
+    .await?;
 ```
 
-Runtime library lookup order:
+## Runtime Library
 
-1. `WsClientConfig::with_lib_path(...)`
-2. `CURL_IMPERSONATE_LIB`
-3. Packaged runtime path near executable (`../lib` and side-by-side)
-4. `IMPCURL_LIB_DIR`
-5. Default runtime directories (`~/.impcurl/lib`, `~/.cuimp/binaries`)
-6. Auto-fetch from `curl_cffi` release wheel (enabled by default)
+The `libcurl-impersonate` shared library is resolved at runtime in this order:
 
-Auto-fetch controls:
+1. `WsClient::builder(...).lib_path(...)` — explicit path
+2. `CURL_IMPERSONATE_LIB` env var
+3. Near executable (`../lib/` and side-by-side)
+4. `IMPCURL_LIB_DIR` env var
+5. `~/.impcurl/lib`, `~/.cuimp/binaries`
+6. Auto-fetch from [curl_cffi](https://github.com/lexiforest/curl_cffi) wheel (enabled by default)
 
-- `IMPCURL_AUTO_FETCH=0` disables runtime download attempts.
-- `IMPCURL_CURL_CFFI_VERSION=<version>` selects `curl_cffi` release tag (default `0.11.3`).
-- `IMPCURL_AUTO_FETCH_CACHE_DIR=/abs/path` overrides fetch cache/output dir.
+### Auto-fetch Controls
 
-## Package
+| Env Var | Description |
+|---------|-------------|
+| `IMPCURL_AUTO_FETCH=0` | Disable auto-download |
+| `IMPCURL_CURL_CFFI_VERSION` | curl_cffi release tag (default `0.11.3`) |
+| `IMPCURL_AUTO_FETCH_CACHE_DIR` | Override fetch cache directory |
 
-Package binary + runtime library into `dist/<target>/`:
+## Architecture
 
-```bash
-./scripts/package
+```
+impcurl-ws (async tokio client)
+  └── impcurl (safe blocking wrapper)
+       └── impcurl-sys (dynamic FFI + auto-fetch)
+            └── libcurl-impersonate (runtime .so/.dylib/.dll)
 ```
 
-## Fetch Runtime Asset
+On Unix, the async event loop uses `CURLMOPT_SOCKETFUNCTION` / `CURLMOPT_TIMERFUNCTION` with `tokio::io::unix::AsyncFd` for efficient socket-level readiness notification. Non-Unix falls back to `curl_multi_poll`.
 
-Download runtime assets from `curl_cffi` release wheels (default) into `vendor/<target>/lib`:
+## License
 
-```bash
-./scripts/fetch-libcurl-impersonate --target aarch64-apple-darwin --curl-cffi-version 0.11.3 --lib-version 1.4.2
-```
-
-If you want the raw upstream `curl-impersonate` release instead:
-
-```bash
-./scripts/fetch-libcurl-impersonate --source curl-impersonate --target aarch64-apple-darwin --lib-version 1.4.2
-```
-
-Notes:
-
-- `curl_cffi` publishes wheels/sdist on GitHub releases; the script resolves wheel assets via GitHub API.
-- Some target wheels may not expose a standalone `libcurl-impersonate` shared library (script prints a warning in that case).
-- Upstream `curl-impersonate` tarballs can be static-only on some targets (`.a` only), which is not usable for runtime `dlopen`.
-
-You can override package/bin/target/lib:
-
-```bash
-./scripts/package --package impcurl-ws --example gmgn_smoke --target x86_64-unknown-linux-gnu --lib /abs/path/libcurl-impersonate.so.4
-```
-
-Output layout:
-
-```text
-dist/<target>/
-  bin/<artifact>[.exe]
-  lib/<runtime library>
-  manifest.json
-```
-
-Archive output:
-
-- `dist/impcurl-ws-<target>.tar.gz` (non-Windows)
-- `dist/impcurl-ws-<target>.zip` (Windows)
+MIT OR Apache-2.0
