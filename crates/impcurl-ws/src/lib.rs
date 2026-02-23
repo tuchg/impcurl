@@ -2,12 +2,12 @@ use anyhow::{Context, Result, bail};
 use impcurl::{
     MultiSession, WebSocketConnectConfig, WsFrameAssembler,
     complete_connect_only_websocket_handshake_with_multi, detach_easy_from_multi,
-    ensure_curl_global_init, prepare_connect_only_websocket_session, ws_send_text,
+    ensure_curl_global_init, prepare_connect_only_websocket_session, ws_send,
     ws_try_recv_frame,
 };
 use impcurl_sys::{
     CURL_CSELECT_ERR, CURL_CSELECT_IN, CURL_CSELECT_OUT, CURL_POLL_IN, CURL_POLL_INOUT,
-    CURL_POLL_OUT, CURL_POLL_REMOVE, CURLE_AGAIN, Curl, CurlApi, CurlSocket,
+    CURL_POLL_OUT, CURL_POLL_REMOVE, CURLE_AGAIN, CURLWS_TEXT, Curl, CurlApi, CurlSocket,
 };
 #[cfg(unix)]
 use std::collections::HashMap;
@@ -34,7 +34,7 @@ use tracing::{debug, info, warn};
 
 #[derive(Debug)]
 enum WorkerCommand {
-    SendText(String),
+    Send(Vec<u8>),
     Shutdown,
 }
 
@@ -50,8 +50,8 @@ enum WorkerEvent {
 struct WsClientConfig {
     lib_path: Option<PathBuf>,
     url: String,
-    origin: Option<String>,
-    user_agent: Option<String>,
+    headers: Vec<String>,
+    proxy: Option<String>,
     impersonate_target: impcurl::ImpersonateTarget,
     verbose: bool,
     connect_timeout: Duration,
@@ -66,8 +66,8 @@ impl WsClientConfig {
         Self {
             lib_path: None,
             url: url.into(),
-            origin: None,
-            user_agent: None,
+            headers: Vec::new(),
+            proxy: None,
             impersonate_target: impcurl::ImpersonateTarget::Chrome136,
             verbose: false,
             connect_timeout: Duration::from_secs(20),
@@ -85,13 +85,13 @@ pub struct WsClientBuilder {
 }
 
 impl WsClientBuilder {
-    pub fn origin(mut self, origin: impl Into<String>) -> Self {
-        self.cfg.origin = Some(origin.into());
+    pub fn header(mut self, name: impl AsRef<str>, value: impl AsRef<str>) -> Self {
+        self.cfg.headers.push(format!("{}: {}", name.as_ref(), value.as_ref()));
         self
     }
 
-    pub fn user_agent(mut self, ua: impl Into<String>) -> Self {
-        self.cfg.user_agent = Some(ua.into());
+    pub fn proxy(mut self, proxy: impl Into<String>) -> Self {
+        self.cfg.proxy = Some(proxy.into());
         self
     }
 
@@ -140,20 +140,35 @@ impl WsClient {
     }
 
     /// Send a text frame.
-    pub fn send(&self, text: &str) -> Result<()> {
+    pub fn send_text(&self, text: &str) -> Result<()> {
+        self.send(text.as_bytes())
+    }
+
+    /// Send raw bytes as a text frame.
+    pub fn send(&self, data: &[u8]) -> Result<()> {
         self.cmd_tx
-            .send(WorkerCommand::SendText(text.to_owned()))
+            .send(WorkerCommand::Send(data.to_vec()))
             .map_err(|_| anyhow::anyhow!("websocket closed"))
     }
 
-    /// Receive the next text message. Returns `None` on shutdown.
-    pub async fn recv(&mut self) -> Result<Option<String>> {
+    /// Receive the next frame as bytes. Returns `None` on shutdown.
+    pub async fn recv(&mut self) -> Result<Option<Vec<u8>>> {
         self.recv_inner(None).await
     }
 
     /// Receive with a timeout. Returns `None` on shutdown or timeout.
-    pub async fn recv_timeout(&mut self, max_wait: Duration) -> Result<Option<String>> {
+    pub async fn recv_timeout(&mut self, max_wait: Duration) -> Result<Option<Vec<u8>>> {
         self.recv_inner(Some(max_wait)).await
+    }
+
+    /// Receive the next frame as a UTF-8 string.
+    pub async fn recv_text(&mut self) -> Result<Option<String>> {
+        Ok(self.recv().await?.map(|b| String::from_utf8_lossy(&b).into_owned()))
+    }
+
+    /// Receive as UTF-8 string with a timeout.
+    pub async fn recv_text_timeout(&mut self, max_wait: Duration) -> Result<Option<String>> {
+        Ok(self.recv_timeout(max_wait).await?.map(|b| String::from_utf8_lossy(&b).into_owned()))
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
@@ -211,18 +226,14 @@ impl WsClient {
         })
     }
 
-    async fn recv_inner(&mut self, max_wait: Option<Duration>) -> Result<Option<String>> {
+    async fn recv_inner(&mut self, max_wait: Option<Duration>) -> Result<Option<Vec<u8>>> {
         loop {
             let event = match max_wait {
                 Some(d) => timeout(d, self.event_rx.recv()).await.ok().flatten(),
                 None => self.event_rx.recv().await,
             };
             match event {
-                Some(WorkerEvent::Frame { payload }) => {
-                    let text = String::from_utf8(payload)
-                        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
-                    return Ok(Some(text));
-                }
+                Some(WorkerEvent::Frame { payload }) => return Ok(Some(payload)),
                 Some(WorkerEvent::Error(err)) => bail!("websocket worker error: {err}"),
                 Some(WorkerEvent::Connected) => continue,
                 Some(WorkerEvent::Shutdown) | None => return Ok(None),
@@ -483,9 +494,8 @@ fn handle_cmd(
     event_tx: &mpsc::Sender<WorkerEvent>,
 ) -> Result<bool> {
     match cmd {
-        WorkerCommand::SendText(text) => {
-            let data = text.into_bytes();
-            match ws_send_text(api, easy_handle as *mut Curl, &data) {
+        WorkerCommand::Send(data) => {
+            match ws_send(api, easy_handle as *mut Curl, &data, CURLWS_TEXT) {
                 Ok(sent) if sent >= data.len() => {}
                 Ok(sent) => {
                     *pending_send = Some((data, sent));
@@ -536,7 +546,7 @@ async fn run_worker_loop_async(
 
         // resume pending send
         if let Some((ref data, ref mut offset)) = pending_send {
-            match ws_send_text(api, easy_handle as *mut Curl, &data[*offset..]) {
+            match ws_send(api, easy_handle as *mut Curl, &data[*offset..], CURLWS_TEXT) {
                 Ok(sent) => {
                     *offset += sent;
                     if *offset >= data.len() {
@@ -615,7 +625,7 @@ fn run_worker_loop(
         }
 
         if let Some((ref data, ref mut offset)) = pending_send {
-            match ws_send_text(api, easy_handle as *mut Curl, &data[*offset..]) {
+            match ws_send(api, easy_handle as *mut Curl, &data[*offset..], CURLWS_TEXT) {
                 Ok(sent) => {
                     *offset += sent;
                     if *offset >= data.len() {
@@ -675,8 +685,8 @@ async fn run_worker(
 
     let connect_cfg = WebSocketConnectConfig {
         url: &cfg.url,
-        origin: cfg.origin.as_deref(),
-        user_agent: cfg.user_agent.as_deref(),
+        headers: &cfg.headers,
+        proxy: cfg.proxy.as_deref(),
         impersonate_target: cfg.impersonate_target,
         verbose: cfg.verbose,
     };

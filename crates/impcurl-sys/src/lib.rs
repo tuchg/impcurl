@@ -102,6 +102,7 @@ pub const CURLOPT_HTTPHEADER: CurlOption = 10023;
 pub const CURLOPT_HTTP_VERSION: CurlOption = 84;
 pub const CURLOPT_CONNECT_ONLY: CurlOption = 141;
 pub const CURLOPT_VERBOSE: CurlOption = 41;
+pub const CURLOPT_PROXY: CurlOption = 10004;
 
 pub const CURL_HTTP_VERSION_1_1: c_long = 2;
 pub const CURLWS_TEXT: c_uint = 1;

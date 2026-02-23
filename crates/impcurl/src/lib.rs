@@ -2,12 +2,12 @@ use impcurl_sys::{
     CURL_GLOBAL_DEFAULT, CURL_HTTP_VERSION_1_1, CURL_SOCKET_TIMEOUT, CURLE_AGAIN, CURLE_OK,
     CURLM_OK, CURLMOPT_SOCKETDATA, CURLMOPT_SOCKETFUNCTION, CURLMOPT_TIMERDATA,
     CURLMOPT_TIMERFUNCTION, CURLMSG_DONE, CURLOPT_CONNECT_ONLY, CURLOPT_HTTP_VERSION,
-    CURLOPT_HTTPHEADER, CURLOPT_URL, CURLOPT_VERBOSE, CURLWS_TEXT, Curl, CurlApi, CurlCode,
-    CurlMCode, CurlMulti, CurlMultiSocketCallback, CurlMultiTimerCallback, CurlOption, CurlSlist,
-    CurlWsFrame,
+    CURLOPT_HTTPHEADER, CURLOPT_PROXY, CURLOPT_URL, CURLOPT_VERBOSE, Curl, CurlApi,
+    CurlCode, CurlMCode, CurlMulti, CurlMultiSocketCallback, CurlMultiTimerCallback, CurlOption,
+    CurlSlist, CurlWsFrame,
 };
 use std::ffi::CString;
-use std::os::raw::{c_char, c_int, c_long, c_void};
+use std::os::raw::{c_char, c_int, c_long, c_uint, c_void};
 use std::ptr;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -363,8 +363,8 @@ impl ImpersonateTarget {
 
 pub struct WebSocketConnectConfig<'a> {
     pub url: &'a str,
-    pub origin: Option<&'a str>,
-    pub user_agent: Option<&'a str>,
+    pub headers: &'a [String],
+    pub proxy: Option<&'a str>,
     pub impersonate_target: ImpersonateTarget,
     pub verbose: bool,
 }
@@ -412,14 +412,21 @@ fn configure_connect_only_websocket_session(
                     "CURLOPT_VERBOSE",
                 )?;
             }
+            if let Some(proxy) = cfg.proxy {
+                let c_proxy = CString::new(proxy)?;
+                setopt_cstr(
+                    api,
+                    session.easy_handle(),
+                    CURLOPT_PROXY,
+                    c_proxy.as_ptr(),
+                    "CURLOPT_PROXY",
+                )?;
+            }
         }
     }
 
-    if let Some(origin) = cfg.origin {
-        session.append_header(&format!("Origin: {origin}"))?;
-    }
-    if let Some(user_agent) = cfg.user_agent {
-        session.append_header(&format!("User-Agent: {user_agent}"))?;
+    for header in cfg.headers {
+        session.append_header(header)?;
     }
 
     {
@@ -627,7 +634,7 @@ pub fn ws_try_recv_frame(
 }
 
 /// Single-attempt ws_send. Returns bytes sent, or CURLE_AGAIN error if socket not ready.
-pub fn ws_send_text(api: &CurlApi, easy: *mut Curl, data: &[u8]) -> Result<usize> {
+pub fn ws_send(api: &CurlApi, easy: *mut Curl, data: &[u8], flags: c_uint) -> Result<usize> {
     let mut sent = 0usize;
     let code = unsafe {
         (api.ws_send)(
@@ -636,7 +643,7 @@ pub fn ws_send_text(api: &CurlApi, easy: *mut Curl, data: &[u8]) -> Result<usize
             data.len(),
             &mut sent,
             0,
-            CURLWS_TEXT,
+            flags,
         )
     };
     if code == CURLE_OK {
