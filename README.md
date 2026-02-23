@@ -87,4 +87,4 @@ On Unix, the async event loop uses `CURLMOPT_SOCKETFUNCTION` / `CURLMOPT_TIMERFU
 
 ## License
 
-MIT OR Apache-2.0
+MIT
