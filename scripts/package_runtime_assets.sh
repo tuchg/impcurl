@@ -15,17 +15,27 @@ CURL_IMPERSONATE_IMAGE="${CURL_IMPERSONATE_IMAGE:-lexiforest/curl-impersonate:v1
 ASSET_BASE="impcurl-runtime-v${VERSION}-${TARGET}"
 ASSET_DIR="${OUT_DIR}/${ASSET_BASE}"
 ASSET_TGZ="${OUT_DIR}/${ASSET_BASE}.tar.gz"
+MIN_BYTES="${MIN_BYTES:-500000}"
 
 mkdir -p "${ASSET_DIR}"
+rm -f "${ASSET_DIR}/libcurl-impersonate.so.4" "${ASSET_DIR}/libcurl-impersonate.so"
 
-container_id="$(docker create --platform=linux/amd64 "${CURL_IMPERSONATE_IMAGE}" true)"
-cleanup() {
-  docker rm -f "${container_id}" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
+# Copy real library bytes out of container (follow symlinks with cp -L).
+docker run --rm --platform=linux/amd64 \
+  -v "${ASSET_DIR}:/out" \
+  "${CURL_IMPERSONATE_IMAGE}" \
+  sh -c '
+    set -e
+    cp -L /usr/local/lib/libcurl-impersonate.so.4 /out/libcurl-impersonate.so.4
+    cp -L /usr/local/lib/libcurl-impersonate.so /out/libcurl-impersonate.so
+  '
 
-docker cp "${container_id}:/usr/local/lib/libcurl-impersonate.so.4" "${ASSET_DIR}/libcurl-impersonate.so.4"
-docker cp "${container_id}:/usr/local/lib/libcurl-impersonate.so" "${ASSET_DIR}/libcurl-impersonate.so"
+size_so4="$(wc -c < "${ASSET_DIR}/libcurl-impersonate.so.4" | tr -d " ")"
+size_so="$(wc -c < "${ASSET_DIR}/libcurl-impersonate.so" | tr -d " ")"
+if [[ "${size_so4}" -lt "${MIN_BYTES}" || "${size_so}" -lt "${MIN_BYTES}" ]]; then
+  echo "runtime library looks wrong: so.4=${size_so4} bytes, so=${size_so} bytes" >&2
+  exit 1
+fi
 
 tar -czf "${ASSET_TGZ}" -C "${ASSET_DIR}" .
 (cd "${OUT_DIR}" && shasum -a 256 "$(basename "${ASSET_TGZ}")" > "${ASSET_BASE}.sha256")

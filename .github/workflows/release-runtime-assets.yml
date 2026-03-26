@@ -38,6 +38,17 @@ jobs:
         run: |
           ./scripts/package_runtime_assets.sh "${{ steps.version.outputs.version }}" "${TARGET}"
 
+      - name: Verify runtime asset size/content
+        run: |
+          TGZ="dist/runtime-assets/impcurl-runtime-v${{ steps.version.outputs.version }}-${TARGET}.tar.gz"
+          SIZE="$(wc -c < "${TGZ}" | tr -d ' ')"
+          echo "asset size bytes=${SIZE}"
+          if [[ "${SIZE}" -lt 1000000 ]]; then
+            echo "runtime asset is unexpectedly small" >&2
+            exit 1
+          fi
+          tar -tzf "${TGZ}"
+
       - name: Create runtime release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
