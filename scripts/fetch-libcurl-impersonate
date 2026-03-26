@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 TARGET="$(rustc -vV | awk '/^host: / {print $2}')"
 OUT_DIR=""
 KEEP_ARCHIVE=0
@@ -17,7 +17,7 @@ Download versioned impcurl libcurl-impersonate assets into vendor/<target>/lib.
 
 Options:
   --target <triple>      Rust target triple (default: rustc host target)
-  --version <ver>        Asset version (default: 1.1.0)
+  --version <ver>        Asset version (default: 1.1.1)
   --out-dir <dir>        Output directory (default: vendor/<target>/lib)
   --keep-archive         Keep downloaded archive
   -h, --help             Show this help

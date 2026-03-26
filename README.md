@@ -21,7 +21,7 @@ Bypass TLS fingerprinting by impersonating real browser signatures (Chrome, Safa
 
 ```toml
 [dependencies]
-impcurl-ws = "1.1.0"
+impcurl-ws = "1.1.1"
 futures-util = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
