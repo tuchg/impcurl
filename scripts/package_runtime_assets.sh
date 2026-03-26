@@ -17,11 +17,24 @@ ASSET_DIR="${OUT_DIR}/${ASSET_BASE}"
 ASSET_TGZ="${OUT_DIR}/${ASSET_BASE}.tar.gz"
 MIN_BYTES="${MIN_BYTES:-500000}"
 
+case "${TARGET}" in
+  x86_64-unknown-linux-gnu | x86_64-unknown-linux-musl)
+    DOCKER_PLATFORM="linux/amd64"
+    ;;
+  aarch64-unknown-linux-gnu | aarch64-unknown-linux-musl)
+    DOCKER_PLATFORM="linux/arm64"
+    ;;
+  *)
+    echo "unsupported TARGET for runtime packaging: ${TARGET}" >&2
+    exit 1
+    ;;
+esac
+
 mkdir -p "${ASSET_DIR}"
 rm -f "${ASSET_DIR}/libcurl-impersonate.so.4" "${ASSET_DIR}/libcurl-impersonate.so"
 
 # Copy real library bytes out of container (follow symlinks with cp -L).
-docker run --rm --platform=linux/amd64 \
+docker run --rm --platform="${DOCKER_PLATFORM}" \
   -v "${ASSET_DIR}:/out" \
   "${CURL_IMPERSONATE_IMAGE}" \
   sh -c '

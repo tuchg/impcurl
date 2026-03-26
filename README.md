@@ -129,4 +129,6 @@ This repository includes a workflow that publishes versioned runtime assets:
 Asset naming:
 
 - `impcurl-runtime-v<version>-x86_64-unknown-linux-gnu.tar.gz`
+- `impcurl-runtime-v<version>-aarch64-unknown-linux-gnu.tar.gz`
 - `impcurl-runtime-v<version>-x86_64-unknown-linux-gnu.sha256`
+- `impcurl-runtime-v<version>-aarch64-unknown-linux-gnu.sha256`
