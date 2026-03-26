@@ -1,8 +1,8 @@
 use impcurl_sys::{
-    CURL_GLOBAL_DEFAULT, CURL_HTTP_VERSION_1_1, CURL_SOCKET_TIMEOUT, CURLE_AGAIN, CURLE_OK,
+    CURL_GLOBAL_DEFAULT, CURL_SOCKET_TIMEOUT, CURLE_AGAIN, CURLE_OK,
     CURLINFO_RESPONSE_CODE, CURLM_OK, CURLMOPT_SOCKETDATA, CURLMOPT_SOCKETFUNCTION,
     CURLMOPT_TIMERDATA, CURLMOPT_TIMERFUNCTION, CURLMSG_DONE, CURLOPT_CONNECT_ONLY,
-    CURLOPT_HTTP_VERSION, CURLOPT_HTTPHEADER, CURLOPT_PROXY, CURLOPT_URL, CURLOPT_VERBOSE, Curl,
+    CURLOPT_HTTPHEADER, CURLOPT_PROXY, CURLOPT_URL, CURLOPT_VERBOSE, Curl,
     CurlApi, CurlCode, CurlMCode, CurlMulti, CurlMultiSocketCallback, CurlMultiTimerCallback,
     CurlOption, CurlSlist, CurlWsFrame,
 };
@@ -389,13 +389,6 @@ fn configure_connect_only_websocket_session(
                 CURLOPT_URL,
                 c_url.as_ptr(),
                 "CURLOPT_URL",
-            )?;
-            setopt_long(
-                api,
-                session.easy_handle(),
-                CURLOPT_HTTP_VERSION,
-                CURL_HTTP_VERSION_1_1,
-                "CURLOPT_HTTP_VERSION",
             )?;
             setopt_long(
                 api,
