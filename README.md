@@ -132,3 +132,7 @@ Asset naming:
 - `impcurl-runtime-v<version>-aarch64-unknown-linux-gnu.tar.gz`
 - `impcurl-runtime-v<version>-x86_64-unknown-linux-gnu.sha256`
 - `impcurl-runtime-v<version>-aarch64-unknown-linux-gnu.sha256`
+
+Note: `aarch64` publishing depends on an available ARM64 source image for
+`libcurl-impersonate`. The workflow has an explicit ARM64 image input so the
+asset can be enabled once that source is available.

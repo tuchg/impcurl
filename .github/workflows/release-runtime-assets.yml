@@ -16,6 +16,7 @@ permissions:
 jobs:
   package-and-upload:
     runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.target == 'aarch64-unknown-linux-gnu' }}
     strategy:
       fail-fast: false
       matrix:
@@ -24,6 +25,8 @@ jobs:
           - aarch64-unknown-linux-gnu
     env:
       TARGET: ${{ matrix.target }}
+      CURL_IMPERSONATE_IMAGE_AMD64: lexiforest/curl-impersonate:v1.5.1@sha256:0e43f7ef4007ce957fcd6532f4295d0193f9178f4e6eccb1a6f754d64f7f9fcd
+      CURL_IMPERSONATE_IMAGE_ARM64: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,11 +43,38 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "tag=impcurl-runtime-v${VERSION}" >> "${GITHUB_OUTPUT}"
 
+      - name: Resolve runtime image
+        id: runtime-image
+        run: |
+          if [[ "${TARGET}" == "x86_64-unknown-linux-gnu" ]]; then
+            echo "image=${CURL_IMPERSONATE_IMAGE_AMD64}" >> "${GITHUB_OUTPUT}"
+            echo "skip=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ "${TARGET}" == "aarch64-unknown-linux-gnu" ]]; then
+            if [[ -z "${CURL_IMPERSONATE_IMAGE_ARM64}" ]]; then
+              echo "No ARM64 runtime image configured, skipping ${TARGET} packaging."
+              echo "skip=true" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            echo "image=${CURL_IMPERSONATE_IMAGE_ARM64}" >> "${GITHUB_OUTPUT}"
+            echo "skip=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "Unsupported TARGET=${TARGET}" >&2
+          exit 1
+
       - name: Build runtime assets
+        if: steps.runtime-image.outputs.skip != 'true'
+        env:
+          CURL_IMPERSONATE_IMAGE: ${{ steps.runtime-image.outputs.image }}
         run: |
           ./scripts/package_runtime_assets.sh "${{ steps.version.outputs.version }}" "${TARGET}"
 
       - name: Verify runtime asset size/content
+        if: steps.runtime-image.outputs.skip != 'true'
         run: |
           TGZ="dist/runtime-assets/impcurl-runtime-v${{ steps.version.outputs.version }}-${TARGET}.tar.gz"
           SIZE="$(wc -c < "${TGZ}" | tr -d ' ')"
@@ -56,6 +86,7 @@ jobs:
           tar -tzf "${TGZ}"
 
       - name: Create runtime release
+        if: steps.runtime-image.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
