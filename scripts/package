@@ -26,11 +26,11 @@ Options:
   --package <name>        Cargo package name (default: impcurl-ws)
   --bin <name>            Package a binary target
   --example <name>        Package an example target (default: gmgn_smoke)
-  --lib <path>            Path to runtime libcurl-impersonate library
+  --lib <path>            Path to shared libcurl-impersonate library
   --out-dir <dir>         Output directory (default: ./dist)
   --debug                 Build debug profile (default: release)
   --skip-build            Skip cargo build
-  --allow-missing-lib     Package artifact even if runtime library is not found
+  --allow-missing-lib     Package artifact even if shared library is not found
   -h, --help              Show this help
 
 Exactly one of --bin or --example is used. If --bin is provided, --example is ignored.
@@ -178,27 +178,6 @@ resolve_lib_path() {
     fi
   done
 
-  for base in \
-    "${HOME}/miniconda3/lib" \
-    "${HOME}/anaconda3/lib" \
-    "${HOME}/.local/lib" \
-    "/opt/homebrew/Caskroom/miniconda/base/lib"; do
-    [[ -d "${base}" ]] || continue
-    shopt -s nullglob
-    for pyver in "${base}"/python*/site-packages/curl_cffi/.dylibs; do
-      [[ -d "${pyver}" ]] || continue
-      for name in "${LIB_CANDIDATES[@]}"; do
-        candidate="${pyver}/${name}"
-        if [[ -f "${candidate}" ]]; then
-          shopt -u nullglob
-          echo "${candidate}"
-          return 0
-        fi
-      done
-    done
-    shopt -u nullglob
-  done
-
   return 1
 }
 
@@ -208,7 +187,7 @@ if RUNTIME_LIB="$(resolve_lib_path)"; then
 elif [[ "${ALLOW_MISSING_LIB}" -eq 1 ]]; then
   RUNTIME_LIB=""
 else
-  echo "error: failed to locate runtime library. use --lib or set CURL_IMPERSONATE_LIB" >&2
+  echo "error: failed to locate shared library. use --lib or set CURL_IMPERSONATE_LIB" >&2
   exit 1
 fi
 
@@ -259,11 +238,11 @@ MANIFEST="${PACKAGE_ROOT}/manifest.json"
   echo "  \"built_at_utc\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\","
   echo "  \"binary\": \"$(relpath "${PACKAGED_BIN}")\","
   if [[ -n "${RUNTIME_LIB}" ]]; then
-    echo "  \"runtime_lib\": \"lib/$(basename "${RUNTIME_LIB}")\","
+    echo "  \"shared_lib\": \"lib/$(basename "${RUNTIME_LIB}")\","
   else
-    echo "  \"runtime_lib\": null,"
+    echo "  \"shared_lib\": null,"
   fi
-  echo "  \"runtime_libs\": ["
+  echo "  \"shared_libs\": ["
   for i in "${!RUNTIME_LIBS[@]}"; do
     comma=","
     if [[ "${i}" -eq $((${#RUNTIME_LIBS[@]} - 1)) ]]; then
@@ -302,8 +281,8 @@ fi
 echo "packaged root: ${PACKAGE_ROOT}"
 echo "archive: ${ARCHIVE_PATH}"
 if [[ -n "${RUNTIME_LIB}" ]]; then
-  echo "runtime lib: ${LIB_DIR}/$(basename "${RUNTIME_LIB}")"
-  echo "runtime lib count: ${#RUNTIME_LIBS[@]}"
+  echo "shared lib: ${LIB_DIR}/$(basename "${RUNTIME_LIB}")"
+  echo "shared lib count: ${#RUNTIME_LIBS[@]}"
 else
-  echo "runtime lib: <missing>"
+  echo "shared lib: <missing>"
 fi

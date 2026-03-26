@@ -1,0 +1,95 @@
+name: release-libcurl-impersonate-assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version number without leading v (example: 1.0.1)"
+        required: true
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  package-and-upload:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.target == 'aarch64-unknown-linux-gnu' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    env:
+      TARGET: ${{ matrix.target }}
+      CURL_IMPERSONATE_IMAGE_AMD64: lexiforest/curl-impersonate:v1.5.1@sha256:0e43f7ef4007ce957fcd6532f4295d0193f9178f4e6eccb1a6f754d64f7f9fcd
+      CURL_IMPERSONATE_IMAGE_ARM64: ""
+      CURL_IMPERSONATE_VERSION: "1.5.1"
+      CURL_CFFI_VERSION: "0.11.3"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            RAW="${GITHUB_REF_NAME}"
+            VERSION="${RAW#v}"
+          else
+            VERSION="${{ github.event.inputs.version }}"
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tag=impcurl-libcurl-impersonate-v${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build libcurl-impersonate assets
+        env:
+          CURL_IMPERSONATE_IMAGE: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && env.CURL_IMPERSONATE_IMAGE_AMD64 || env.CURL_IMPERSONATE_IMAGE_ARM64 }}
+          CURL_IMPERSONATE_VERSION: ${{ env.CURL_IMPERSONATE_VERSION }}
+          CURL_CFFI_VERSION: ${{ env.CURL_CFFI_VERSION }}
+        run: |
+          if [[ "${TARGET}" == "aarch64-unknown-linux-gnu" && -z "${CURL_IMPERSONATE_IMAGE}" ]]; then
+            echo "No ARM64 source image configured, skipping ${TARGET} packaging."
+            exit 0
+          fi
+          ./scripts/package_libcurl_assets.sh "${{ steps.version.outputs.version }}" "${TARGET}"
+
+      - name: Verify libcurl-impersonate asset size/content
+        run: |
+          TGZ="dist/libcurl-impersonate-assets/impcurl-libcurl-impersonate-v${{ steps.version.outputs.version }}-${TARGET}.tar.gz"
+          if [[ ! -f "${TGZ}" ]]; then
+            echo "No libcurl-impersonate artifact generated for ${TARGET}; skipping verify step."
+            exit 0
+          fi
+          SIZE="$(wc -c < "${TGZ}" | tr -d ' ')"
+          echo "asset size bytes=${SIZE}"
+          if [[ "${SIZE}" -lt 1000000 ]]; then
+            echo "libcurl-impersonate artifact is unexpectedly small" >&2
+            exit 1
+          fi
+          tar -tzf "${TGZ}"
+
+      - name: Create libcurl-impersonate asset release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TGZ="dist/libcurl-impersonate-assets/impcurl-libcurl-impersonate-v${{ steps.version.outputs.version }}-${TARGET}.tar.gz"
+          SHA="dist/libcurl-impersonate-assets/impcurl-libcurl-impersonate-v${{ steps.version.outputs.version }}-${TARGET}.sha256"
+          if [[ ! -f "${TGZ}" || ! -f "${SHA}" ]]; then
+            echo "No libcurl-impersonate artifact generated for ${TARGET}; skipping upload step."
+            exit 0
+          fi
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --notes "Versioned libcurl-impersonate assets for impcurl auto-fetch." \
+            "${TGZ}" \
+            "${SHA}" \
+          || gh release upload "${{ steps.version.outputs.tag }}" \
+            --clobber \
+            "${TGZ}" \
+            "${SHA}"

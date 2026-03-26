@@ -12,7 +12,5 @@ categories = ["external-ffi-bindings", "web-programming"]
 
 [dependencies]
 libloading.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-zip = { version = "2.4.2", default-features = false, features = ["deflate"] }

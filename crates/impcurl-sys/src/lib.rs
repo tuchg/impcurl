@@ -1,7 +1,6 @@
 use libloading::Library;
-use serde_json::Value;
 use std::ffi::CStr;
-use std::fs::{self, File};
+use std::fs::{self};
 use std::io;
 use std::mem::ManuallyDrop;
 use std::os::raw::{c_char, c_int, c_long, c_short, c_uint, c_ulong, c_void};
@@ -9,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, info};
-use zip::ZipArchive;
 
 pub type CurlCode = c_int;
 pub type CurlOption = c_uint;
@@ -146,30 +144,11 @@ pub enum SysError {
         status: Option<i32>,
         stderr: String,
     },
-    #[error("failed to parse GitHub release JSON: {0}")]
-    AutoFetchJson(#[from] serde_json::Error),
     #[error("I/O error during auto-fetch: {0}")]
     AutoFetchIo(#[from] io::Error),
-    #[error("failed to extract wheel archive: {0}")]
-    AutoFetchWheel(#[from] zip::result::ZipError),
-    #[error("no matching curl_cffi wheel asset for version={version}, platform_tag={platform_tag}")]
-    AutoFetchWheelAssetNotFound {
-        version: String,
-        platform_tag: String,
-    },
-    #[error(
-        "wheel extracted shared objects into {cache_dir}, but no standalone libcurl-impersonate runtime was found"
-    )]
+    #[error("no standalone libcurl-impersonate shared library was found in {cache_dir}")]
     AutoFetchNoStandaloneRuntime { cache_dir: PathBuf },
-    #[error(
-        "no standalone libcurl-impersonate runtime found in {cache_dir}; runtime-asset fetch: {runtime_error}; curl_cffi fetch: {cffi_error}"
-    )]
-    AutoFetchNoStandaloneRuntimeWithReasons {
-        cache_dir: PathBuf,
-        runtime_error: String,
-        cffi_error: String,
-    },
-    #[error("no runtime asset naming rule for target: {0}")]
+    #[error("no libcurl-impersonate asset naming rule for target: {0}")]
     AutoFetchRuntimeUnsupportedTarget(String),
 }
 
@@ -523,7 +502,7 @@ fn probe_library_dir(dir: &Path, searched: &mut Vec<PathBuf>) -> Option<PathBuf>
     None
 }
 
-fn default_runtime_search_roots() -> Vec<PathBuf> {
+fn default_library_search_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
     if let Ok(dir) = std::env::var("IMPCURL_LIB_DIR") {
@@ -650,24 +629,10 @@ fn current_target_triple() -> &'static str {
     }
 }
 
-fn wheel_platform_tag_for_target(target: &str) -> Option<&'static str> {
+fn asset_target_for_triple(target: &str) -> Option<&'static str> {
     match target {
-        "x86_64-apple-darwin" => Some("macosx_10_9_x86_64"),
-        "aarch64-apple-darwin" => Some("macosx_11_0_arm64"),
-        "x86_64-unknown-linux-gnu" => Some("manylinux_2_17_x86_64.manylinux2014_x86_64"),
-        "aarch64-unknown-linux-gnu" => Some("manylinux_2_17_aarch64.manylinux2014_aarch64"),
-        "i686-unknown-linux-gnu" => Some("manylinux_2_17_i686.manylinux2014_i686"),
-        "x86_64-unknown-linux-musl" => Some("musllinux_1_1_x86_64"),
-        "aarch64-unknown-linux-musl" => Some("musllinux_1_1_aarch64"),
-        "x86_64-pc-windows-msvc" | "x86_64-pc-windows-gnu" => Some("win_amd64"),
-        "i686-pc-windows-msvc" | "i686-pc-windows-gnu" => Some("win32"),
-        "aarch64-pc-windows-msvc" => Some("win_arm64"),
-        _ => None,
-    }
-}
-
-fn runtime_asset_target_for_triple(target: &str) -> Option<&'static str> {
-    match target {
+        "x86_64-apple-darwin" => Some("x86_64-apple-darwin"),
+        "aarch64-apple-darwin" => Some("aarch64-apple-darwin"),
         "x86_64-unknown-linux-gnu" => Some("x86_64-unknown-linux-gnu"),
         "aarch64-unknown-linux-gnu" => Some("aarch64-unknown-linux-gnu"),
         "x86_64-unknown-linux-musl" => Some("x86_64-unknown-linux-musl"),
@@ -676,43 +641,31 @@ fn runtime_asset_target_for_triple(target: &str) -> Option<&'static str> {
     }
 }
 
-fn runtime_version() -> String {
-    std::env::var("IMPCURL_RUNTIME_VERSION")
+fn asset_version() -> String {
+    std::env::var("IMPCURL_LIBCURL_VERSION")
         .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_owned())
 }
 
-fn runtime_repo() -> String {
-    std::env::var("IMPCURL_RUNTIME_REPO").unwrap_or_else(|_| "tuchg/impcurl".to_owned())
+fn asset_repo() -> String {
+    std::env::var("IMPCURL_LIBCURL_REPO").unwrap_or_else(|_| "tuchg/impcurl".to_owned())
 }
 
-fn runtime_release_tag(version: &str) -> String {
-    format!("impcurl-runtime-v{version}")
+fn asset_release_tag(version: &str) -> String {
+    format!("impcurl-libcurl-impersonate-v{version}")
 }
 
-fn runtime_asset_name(version: &str, target: &str) -> String {
-    format!("impcurl-runtime-v{version}-{target}.tar.gz")
+fn asset_name(version: &str, target: &str) -> String {
+    format!("impcurl-libcurl-impersonate-v{version}-{target}.tar.gz")
 }
 
-fn runtime_cache_dir(base: &Path, version: &str, target: &str) -> PathBuf {
-    base.join("runtime").join(version).join(target)
+fn asset_cache_dir(base: &Path, version: &str, target: &str) -> PathBuf {
+    base.join("libcurl-impersonate-assets")
+        .join(version)
+        .join(target)
 }
 
-fn runtime_asset_url(repo: &str, tag: &str, asset_name: &str) -> String {
+fn asset_url(repo: &str, tag: &str, asset_name: &str) -> String {
     format!("https://github.com/{repo}/releases/download/{tag}/{asset_name}")
-}
-
-fn is_shared_library_name(file_name: &str) -> bool {
-    if cfg!(target_os = "macos") {
-        file_name.ends_with(".dylib")
-    } else if cfg!(target_os = "linux") {
-        file_name.contains(".so")
-    } else if cfg!(target_os = "windows") {
-        file_name.to_ascii_lowercase().ends_with(".dll")
-    } else {
-        file_name.ends_with(".dylib")
-            || file_name.contains(".so")
-            || file_name.to_ascii_lowercase().ends_with(".dll")
-    }
 }
 
 fn run_download_command(command: &mut Command, command_label: &str) -> Result<Vec<u8>, SysError> {
@@ -733,28 +686,6 @@ fn run_download_command(command: &mut Command, command_label: &str) -> Result<Ve
         status: output.status.code(),
         stderr,
     })
-}
-
-fn fetch_url_to_string(url: &str) -> Result<String, SysError> {
-    let mut curl_cmd = Command::new("curl");
-    curl_cmd
-        .arg("-fsSL")
-        .arg("-H")
-        .arg("User-Agent: impcurl-sys")
-        .arg(url);
-    match run_download_command(&mut curl_cmd, "curl") {
-        Ok(stdout) => {
-            let body = String::from_utf8_lossy(&stdout).to_string();
-            return Ok(body);
-        }
-        Err(SysError::AutoFetchCommandSpawn { .. }) => {}
-        Err(err) => return Err(err),
-    }
-
-    let mut wget_cmd = Command::new("wget");
-    wget_cmd.arg("-qO-").arg(url);
-    let stdout = run_download_command(&mut wget_cmd, "wget")?;
-    Ok(String::from_utf8_lossy(&stdout).to_string())
 }
 
 fn fetch_url_to_file(url: &str, output_path: &Path) -> Result<(), SysError> {
@@ -796,18 +727,18 @@ fn extract_tar_gz_archive(archive_path: &Path, output_dir: &Path) -> Result<(), 
     Ok(())
 }
 
-fn auto_fetch_from_runtime_assets(cache_dir: &Path) -> Result<PathBuf, SysError> {
-    let version = runtime_version();
+fn auto_fetch_from_assets(cache_dir: &Path) -> Result<PathBuf, SysError> {
+    let version = asset_version();
     let target_triple = current_target_triple().to_owned();
-    let target = runtime_asset_target_for_triple(&target_triple)
+    let target = asset_target_for_triple(&target_triple)
         .ok_or_else(|| SysError::AutoFetchRuntimeUnsupportedTarget(target_triple.clone()))?;
-    let repo = runtime_repo();
-    let tag = runtime_release_tag(&version);
-    let asset = runtime_asset_name(&version, target);
-    let url = runtime_asset_url(&repo, &tag, &asset);
-    let output_dir = runtime_cache_dir(cache_dir, &version, target);
+    let repo = asset_repo();
+    let output_dir = asset_cache_dir(cache_dir, &version, target);
+    let tag = asset_release_tag(&version);
+    let asset = asset_name(&version, target);
+    let url = asset_url(&repo, &tag, &asset);
     let archive_path = cache_dir.join(format!(
-        ".runtime-{version}-{target}-{}.tar.gz",
+        ".libcurl-impersonate-asset-{version}-{target}-{}.tar.gz",
         std::process::id()
     ));
 
@@ -815,7 +746,7 @@ fn auto_fetch_from_runtime_assets(cache_dir: &Path) -> Result<PathBuf, SysError>
         cache_dir = %cache_dir.display(),
         output_dir = %output_dir.display(),
         url = %url,
-        "auto-fetching runtime library from versioned release asset"
+        "auto-fetching libcurl-impersonate from asset release"
     );
 
     fetch_url_to_file(&url, &archive_path)?;
@@ -825,100 +756,9 @@ fn auto_fetch_from_runtime_assets(cache_dir: &Path) -> Result<PathBuf, SysError>
     let mut searched = Vec::new();
     probe_library_dir(&output_dir, &mut searched).ok_or_else(|| {
         SysError::AutoFetchNoStandaloneRuntime {
-            cache_dir: output_dir.clone(),
+            cache_dir: output_dir,
         }
     })
-}
-
-fn select_curl_cffi_wheel_download_url(
-    release_json: &str,
-    version: &str,
-    platform_tag: &str,
-) -> Option<String> {
-    let parsed: Value = serde_json::from_str(release_json).ok()?;
-    let assets = parsed.get("assets")?.as_array()?;
-    for asset in assets {
-        let name = asset.get("name")?.as_str()?;
-        if !name.starts_with(&format!("curl_cffi-{version}-")) {
-            continue;
-        }
-        if !name.contains("-abi3-") {
-            continue;
-        }
-        if !name.ends_with(&format!("-{platform_tag}.whl")) {
-            continue;
-        }
-        let url = asset.get("browser_download_url")?.as_str()?;
-        return Some(url.to_owned());
-    }
-    None
-}
-
-fn extract_shared_libraries_from_wheel(
-    wheel_path: &Path,
-    output_dir: &Path,
-) -> Result<Vec<PathBuf>, SysError> {
-    let wheel_file = File::open(wheel_path)?;
-    let mut archive = ZipArchive::new(wheel_file)?;
-    let mut copied = Vec::new();
-
-    for index in 0..archive.len() {
-        let mut file = archive.by_index(index)?;
-        if !file.is_file() {
-            continue;
-        }
-        let file_name = match Path::new(file.name()).file_name().and_then(|s| s.to_str()) {
-            Some(name) => name,
-            None => continue,
-        };
-        if !is_shared_library_name(file_name) {
-            continue;
-        }
-        let dst = output_dir.join(file_name);
-        let mut out = File::create(&dst)?;
-        io::copy(&mut file, &mut out)?;
-        copied.push(dst);
-    }
-
-    Ok(copied)
-}
-
-fn auto_fetch_from_curl_cffi(cache_dir: &Path) -> Result<(), SysError> {
-    info!(cache_dir = %cache_dir.display(), "auto-fetching curl-impersonate from curl_cffi wheel");
-    fs::create_dir_all(cache_dir)?;
-
-    let cffi_version =
-        std::env::var("IMPCURL_CURL_CFFI_VERSION").unwrap_or_else(|_| "0.11.3".to_owned());
-    let target = current_target_triple();
-    let platform_tag = wheel_platform_tag_for_target(target)
-        .ok_or_else(|| SysError::AutoFetchUnsupportedTarget(target.to_owned()))?;
-
-    let release_api_url =
-        format!("https://api.github.com/repos/lexiforest/curl_cffi/releases/tags/v{cffi_version}");
-    let release_json = fetch_url_to_string(&release_api_url)?;
-    let wheel_url = select_curl_cffi_wheel_download_url(&release_json, &cffi_version, platform_tag)
-        .ok_or_else(|| SysError::AutoFetchWheelAssetNotFound {
-            version: cffi_version.clone(),
-            platform_tag: platform_tag.to_owned(),
-        })?;
-
-    let wheel_path = cache_dir.join(format!(
-        ".curl_cffi-{cffi_version}-{platform_tag}-{}.whl",
-        std::process::id()
-    ));
-
-    fetch_url_to_file(&wheel_url, &wheel_path)?;
-    let _ = extract_shared_libraries_from_wheel(&wheel_path, cache_dir)?;
-    let _ = fs::remove_file(&wheel_path);
-
-    let mut searched = Vec::new();
-    if probe_library_dir(cache_dir, &mut searched).is_none() {
-        return Err(SysError::AutoFetchNoStandaloneRuntime {
-            cache_dir: cache_dir.to_path_buf(),
-        });
-    }
-
-    Ok(())
 }
 
 pub fn resolve_impersonate_lib_path(extra_search_roots: &[PathBuf]) -> Result<PathBuf, SysError> {
@@ -943,7 +783,7 @@ pub fn resolve_impersonate_lib_path(extra_search_roots: &[PathBuf]) -> Result<Pa
         }
     }
 
-    for root in default_runtime_search_roots() {
+    for root in default_library_search_roots() {
         if let Some(found) = probe_library_dir(&root, &mut searched) {
             return Ok(found);
         }
@@ -953,40 +793,25 @@ pub fn resolve_impersonate_lib_path(extra_search_roots: &[PathBuf]) -> Result<Pa
         let auto_fetch_result = (|| -> Result<PathBuf, SysError> {
             let cache_dir = auto_fetch_cache_dir()?;
             let target_triple = current_target_triple().to_owned();
-            let target = runtime_asset_target_for_triple(&target_triple).ok_or_else(|| {
+            let target = asset_target_for_triple(&target_triple).ok_or_else(|| {
                 SysError::AutoFetchRuntimeUnsupportedTarget(target_triple.clone())
             })?;
-            let version = runtime_version();
-            let runtime_dir = runtime_cache_dir(&cache_dir, &version, target);
-            if let Some(found) = probe_library_dir(&runtime_dir, &mut searched) {
+            let version = asset_version();
+            let asset_dir = asset_cache_dir(&cache_dir, &version, target);
+            if let Some(found) = probe_library_dir(&asset_dir, &mut searched) {
                 return Ok(found);
             }
             if let Some(found) = probe_library_dir(&cache_dir, &mut searched) {
                 return Ok(found);
             }
 
-            let runtime_fetch_err = auto_fetch_from_runtime_assets(&cache_dir).err();
-            if let Some(found) = probe_library_dir(&runtime_dir, &mut searched) {
+            auto_fetch_from_assets(&cache_dir)?;
+            if let Some(found) = probe_library_dir(&asset_dir, &mut searched) {
                 return Ok(found);
             }
-            if let Some(found) = probe_library_dir(&cache_dir, &mut searched) {
-                return Ok(found);
-            }
-
-            let cffi_fetch_err = auto_fetch_from_curl_cffi(&cache_dir).err();
             probe_library_dir(&cache_dir, &mut searched).ok_or_else(|| {
-                let runtime_text = runtime_fetch_err
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "not attempted".to_owned());
-                let cffi_text = cffi_fetch_err
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "not attempted".to_owned());
-                SysError::AutoFetchNoStandaloneRuntimeWithReasons {
+                SysError::AutoFetchNoStandaloneRuntime {
                     cache_dir: cache_dir.to_path_buf(),
-                    runtime_error: runtime_text,
-                    cffi_error: cffi_text,
                 }
             })
         })();
@@ -1005,34 +830,8 @@ pub fn resolve_impersonate_lib_path(extra_search_roots: &[PathBuf]) -> Result<Pa
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        resolve_ca_bundle_path, runtime_asset_name, runtime_release_tag,
-        select_curl_cffi_wheel_download_url,
-    };
+    use super::{resolve_ca_bundle_path, asset_name, asset_release_tag};
     use std::{env, ffi::OsString};
-
-    #[test]
-    fn picks_matching_wheel_asset_url() {
-        let release_json = r#"
-        {
-          "assets": [
-            {
-              "name": "curl_cffi-0.11.3-cp39-abi3-macosx_10_9_x86_64.whl",
-              "browser_download_url": "https://example.test/x86_64.whl"
-            },
-            {
-              "name": "curl_cffi-0.11.3-cp39-abi3-macosx_11_0_arm64.whl",
-              "browser_download_url": "https://example.test/arm64.whl"
-            }
-          ]
-        }
-        "#;
-
-        let url = select_curl_cffi_wheel_download_url(release_json, "0.11.3", "macosx_11_0_arm64")
-            .expect("expected matching wheel URL");
-
-        assert_eq!(url, "https://example.test/arm64.whl");
-    }
 
     #[test]
     fn prefers_curl_ca_bundle_env_when_file_exists() {
@@ -1045,11 +844,14 @@ mod tests {
     }
 
     #[test]
-    fn runtime_asset_naming_is_versioned() {
-        assert_eq!(runtime_release_tag("1.2.3"), "impcurl-runtime-v1.2.3");
+    fn asset_naming_is_versioned() {
         assert_eq!(
-            runtime_asset_name("1.2.3", "x86_64-unknown-linux-gnu"),
-            "impcurl-runtime-v1.2.3-x86_64-unknown-linux-gnu.tar.gz"
+            asset_release_tag("1.2.3"),
+            "impcurl-libcurl-impersonate-v1.2.3"
+        );
+        assert_eq!(
+            asset_name("1.2.3", "x86_64-unknown-linux-gnu"),
+            "impcurl-libcurl-impersonate-v1.2.3-x86_64-unknown-linux-gnu.tar.gz"
         );
     }
 

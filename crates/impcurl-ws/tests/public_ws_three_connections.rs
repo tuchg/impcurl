@@ -22,7 +22,7 @@ async fn three_public_websocket_connections_do_not_mix_messages() -> Result<()> 
         .unwrap_or_else(|_| DEFAULT_PUBLIC_ECHO_URL.to_owned());
     let round_trips_per_client = parse_round_trips_per_client()?;
     let _ = impcurl_sys::resolve_impersonate_lib_path(&[]).with_context(|| {
-        "failed to resolve libcurl-impersonate; set CURL_IMPERSONATE_LIB to a valid runtime library"
+        "failed to resolve libcurl-impersonate; set CURL_IMPERSONATE_LIB to a valid shared library"
     })?;
     let run_id = format!("impcurl-ws-{}-{}", std::process::id(), now_millis());
 

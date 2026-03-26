@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use futures_util::{Sink, Stream, StreamExt};
 use impcurl::ImpersonateTarget;
-use impcurl_ws::{CloseCode, CloseFrame, Message, ControlFrameMode, WsConnection};
+use impcurl_ws::{CloseCode, CloseFrame, ControlFrameMode, Message, WsConnection};
 use std::time::Duration;
 
 fn assert_stream_sink<T>()

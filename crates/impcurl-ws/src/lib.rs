@@ -5,13 +5,14 @@ use futures_sink::Sink;
 use impcurl::{
     MultiSession, WebSocketConnectConfig, WsFrameAssembler,
     complete_connect_only_websocket_handshake_with_multi, detach_easy_from_multi,
-    ensure_curl_global_init, prepare_connect_only_websocket_session, ws_send,
-    ws_try_recv_frame,
+    ensure_curl_global_init, prepare_connect_only_websocket_session, ws_send, ws_try_recv_frame,
 };
 use impcurl_sys::{
     CURL_CSELECT_ERR, CURL_CSELECT_IN, CURL_CSELECT_OUT, CURL_POLL_IN, CURL_POLL_INOUT,
     CURL_POLL_OUT, CURL_POLL_REMOVE, CURLE_AGAIN, CURLWS_TEXT, Curl, CurlApi, CurlSocket,
 };
+#[cfg(unix)]
+use smallvec::SmallVec;
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
@@ -20,11 +21,10 @@ use std::os::raw::{c_int, c_long, c_void};
 use std::path::PathBuf;
 use std::pin::Pin;
 #[cfg(unix)]
-use smallvec::SmallVec;
-#[cfg(unix)]
 use std::sync::Mutex;
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
+use thiserror::Error as ThisError;
 #[cfg(unix)]
 use tokio::io::Interest;
 #[cfg(unix)]
@@ -38,7 +38,6 @@ use tokio::time::timeout as timeout_async;
 use tokio::time::timeout;
 use tokio_util::sync::{PollSendError, PollSender};
 use tracing::{debug, info, warn};
-use thiserror::Error as ThisError;
 
 const CURLWS_BINARY: u32 = 1 << 1;
 const CURLWS_CLOSE: u32 = 1 << 3;
@@ -51,8 +50,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Errors returned by `WsConnection` and its builder.
 #[derive(Clone, Debug, ThisError, PartialEq, Eq)]
 pub enum Error {
-    /// The runtime `libcurl-impersonate` library could not be resolved or loaded.
-    #[error("failed to resolve runtime library: {message}")]
+    /// The `libcurl-impersonate` shared library could not be resolved or loaded.
+    #[error("failed to resolve libcurl-impersonate shared library: {message}")]
     RuntimeLibrary { message: String },
     /// The WebSocket handshake failed before the connection became usable.
     #[error("failed to connect websocket: {message}")]
@@ -213,7 +212,9 @@ pub struct WsConnectionBuilder {
 impl WsConnectionBuilder {
     /// Appends an HTTP header used during the WebSocket handshake.
     pub fn header(mut self, name: impl AsRef<str>, value: impl AsRef<str>) -> Self {
-        self.cfg.headers.push(format!("{}: {}", name.as_ref(), value.as_ref()));
+        self.cfg
+            .headers
+            .push(format!("{}: {}", name.as_ref(), value.as_ref()));
         self
     }
 
@@ -303,7 +304,7 @@ impl WsConnection {
         Self::connect_inner(WsConnectionConfig::new(url)).await
     }
 
-    /// Returns a builder for advanced handshake and runtime configuration.
+    /// Returns a builder for advanced handshake and library configuration.
     pub fn builder(url: impl Into<String>) -> WsConnectionBuilder {
         WsConnectionBuilder {
             cfg: WsConnectionConfig::new(url),
@@ -490,7 +491,10 @@ impl Sink<Message> for WsConnection {
         self.last_enqueued_sequence = Some(sequence);
 
         Pin::new(&mut self.cmd_tx)
-            .start_send(WorkerCommand::Send { sequence, message: item })
+            .start_send(WorkerCommand::Send {
+                sequence,
+                message: item,
+            })
             .map_err(Self::map_poll_send_error)
     }
 
@@ -580,7 +584,9 @@ struct AsyncFdCache {
 #[cfg(unix)]
 impl AsyncFdCache {
     fn new() -> Self {
-        Self { fds: SmallVec::new() }
+        Self {
+            fds: SmallVec::new(),
+        }
     }
 
     fn sync_with(&mut self, socket_events: &[(CurlSocket, c_int)]) {
@@ -824,10 +830,7 @@ fn decode_close_payload(payload: Vec<u8>) -> AnyResult<Option<CloseFrame>> {
         bail!("invalid websocket close code: {}", code.as_u16());
     }
     let reason = String::from_utf8(payload[2..].to_vec())?;
-    Ok(Some(CloseFrame {
-        code,
-        reason,
-    }))
+    Ok(Some(CloseFrame { code, reason }))
 }
 
 fn is_valid_close_code(code: CloseCode) -> bool {
@@ -875,21 +878,27 @@ fn auto_reply_for_message(
     message: &Message,
 ) -> AnyResult<Option<PendingSend>> {
     match (control_frame_mode, message) {
-        (ControlFrameMode::AutoReply { pong: true, .. }, Message::Ping(payload)) => {
-            Ok(Some(pending_send_from_message(0, Message::Pong(payload.clone()))?))
-        }
+        (ControlFrameMode::AutoReply { pong: true, .. }, Message::Ping(payload)) => Ok(Some(
+            pending_send_from_message(0, Message::Pong(payload.clone()))?,
+        )),
         (
             ControlFrameMode::AutoReply {
-                close_reply: true,
-                ..
+                close_reply: true, ..
             },
             Message::Close(frame),
-        ) => Ok(Some(pending_send_from_message(0, Message::Close(frame.clone()))?)),
+        ) => Ok(Some(pending_send_from_message(
+            0,
+            Message::Close(frame.clone()),
+        )?)),
         _ => Ok(None),
     }
 }
 
-fn try_send_pending(api: &CurlApi, easy_handle: usize, pending: &mut PendingSend) -> AnyResult<bool> {
+fn try_send_pending(
+    api: &CurlApi,
+    easy_handle: usize,
+    pending: &mut PendingSend,
+) -> AnyResult<bool> {
     match ws_send(
         api,
         easy_handle as *mut Curl,
@@ -951,7 +960,10 @@ fn handle_cmd_blocking(
                 flags,
             };
             if try_send_pending(api, easy_handle, &mut send)? {
-                if event_tx.blocking_send(WorkerEvent::Flushed(sequence)).is_err() {
+                if event_tx
+                    .blocking_send(WorkerEvent::Flushed(sequence))
+                    .is_err()
+                {
                     return Ok(true);
                 }
             } else {
@@ -1004,7 +1016,12 @@ async fn run_worker_loop_async(
         if pending_send.is_none() {
             if let Some(mut pending) = protocol_queue.pop_front() {
                 if try_send_pending(api, easy_handle, &mut pending)? {
-                    if pending.sequence != 0 && event_tx.send(WorkerEvent::Flushed(pending.sequence)).await.is_err() {
+                    if pending.sequence != 0
+                        && event_tx
+                            .send(WorkerEvent::Flushed(pending.sequence))
+                            .await
+                            .is_err()
+                    {
                         return Ok(());
                     }
                 } else {
@@ -1021,8 +1038,7 @@ async fn run_worker_loop_async(
         loop {
             match cmd_rx.try_recv() {
                 Ok(cmd) => {
-                    if handle_cmd_async(api, easy_handle, cmd, &mut pending_send, &event_tx)
-                        .await?
+                    if handle_cmd_async(api, easy_handle, cmd, &mut pending_send, &event_tx).await?
                     {
                         return Ok(());
                     }
@@ -1074,7 +1090,10 @@ fn run_worker_loop(
             if let Some(reply) = auto_reply_for_message(control_frame_mode, &message)? {
                 protocol_queue.push_back(reply);
             }
-            if event_tx.blocking_send(WorkerEvent::Message(message)).is_err() {
+            if event_tx
+                .blocking_send(WorkerEvent::Message(message))
+                .is_err()
+            {
                 return Ok(());
             }
         }
@@ -1083,7 +1102,10 @@ fn run_worker_loop(
             if try_send_pending(api, easy_handle, pending)? {
                 let sequence = pending.sequence;
                 pending_send = None;
-                if event_tx.blocking_send(WorkerEvent::Flushed(sequence)).is_err() {
+                if event_tx
+                    .blocking_send(WorkerEvent::Flushed(sequence))
+                    .is_err()
+                {
                     return Ok(());
                 }
             }
@@ -1092,7 +1114,11 @@ fn run_worker_loop(
         if pending_send.is_none() {
             if let Some(mut pending) = protocol_queue.pop_front() {
                 if try_send_pending(api, easy_handle, &mut pending)? {
-                    if pending.sequence != 0 && event_tx.blocking_send(WorkerEvent::Flushed(pending.sequence)).is_err() {
+                    if pending.sequence != 0
+                        && event_tx
+                            .blocking_send(WorkerEvent::Flushed(pending.sequence))
+                            .is_err()
+                    {
                         return Ok(());
                     }
                 } else {
@@ -1214,7 +1240,7 @@ fn resolve_lib_path_for_connect() -> Result<PathBuf> {
     impcurl_sys::resolve_impersonate_lib_path(&[])
         .map_err(|err| Error::RuntimeLibrary {
             message: format!(
-                "{err:#}. set CURL_IMPERSONATE_LIB, set IMPCURL_LIB_DIR, or set IMPCURL_AUTO_FETCH=0 to disable runtime download attempts"
+                "{err:#}. set CURL_IMPERSONATE_LIB, set IMPCURL_LIB_DIR, or set IMPCURL_AUTO_FETCH=0 to disable asset download attempts"
             ),
         })
 }
@@ -1272,9 +1298,12 @@ mod tests {
         .expect("auto-reply mode should enqueue close reply");
         assert_eq!(close_reply.sequence, 0);
         assert_eq!(close_reply.flags, CURLWS_CLOSE);
-        assert_eq!(decode_message(close_reply.flags, close_reply.payload).unwrap(), Message::Close(Some(CloseFrame {
-            code: CloseCode::NORMAL,
-            reason: "bye".to_owned(),
-        })));
+        assert_eq!(
+            decode_message(close_reply.flags, close_reply.payload).unwrap(),
+            Message::Close(Some(CloseFrame {
+                code: CloseCode::NORMAL,
+                reason: "bye".to_owned(),
+            }))
+        );
     }
 }

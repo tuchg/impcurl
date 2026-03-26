@@ -71,16 +71,15 @@ let ws = WsConnection::builder("wss://example.com/ws")
 
 ## Runtime Library
 
-The `libcurl-impersonate` shared library is resolved at runtime in this order:
+The `libcurl-impersonate` shared library is resolved in this order:
 
 1. `CURL_IMPERSONATE_LIB` env var
 2. Near executable (`../lib/` and side-by-side)
 3. `IMPCURL_LIB_DIR` env var
 4. `~/.impcurl/lib`, `~/.cuimp/binaries`
-5. Auto-fetch from versioned runtime assets on this repo's GitHub Releases (enabled by default)
-6. Fallback auto-fetch from [curl_cffi](https://github.com/lexiforest/curl_cffi) wheel
+5. Auto-fetch from versioned libcurl-impersonate assets on this repo's GitHub Releases (enabled by default)
 
-`impcurl-ws` does not expose a `lib_path(...)` builder escape hatch anymore. Runtime library resolution is treated as deployment/runtime configuration rather than a connection-level concern.
+`impcurl-ws` does not expose a `lib_path(...)` builder escape hatch anymore. Library resolution is treated as deployment configuration rather than a connection-level concern.
 
 ## TLS CA Bundle (Linux)
 
@@ -98,9 +97,8 @@ This removes the need for app-level distro-specific CA symlink hacks in most Lin
 | Env Var | Description |
 |---------|-------------|
 | `IMPCURL_AUTO_FETCH=0` | Disable auto-download |
-| `IMPCURL_RUNTIME_VERSION` | Runtime asset version (default current crate version) |
-| `IMPCURL_RUNTIME_REPO` | GitHub repo for runtime assets (default `tuchg/impcurl`) |
-| `IMPCURL_CURL_CFFI_VERSION` | curl_cffi release tag (default `0.11.3`) |
+| `IMPCURL_LIBCURL_VERSION` | libcurl-impersonate asset version (default current crate version) |
+| `IMPCURL_LIBCURL_REPO` | GitHub repo for libcurl-impersonate assets (default `tuchg/impcurl`) |
 | `IMPCURL_AUTO_FETCH_CACHE_DIR` | Override fetch cache directory |
 | `IMPCURL_DISABLE_AUTO_CAINFO=1` | Disable automatic `CURLOPT_CAINFO` injection |
 
@@ -110,7 +108,7 @@ This removes the need for app-level distro-specific CA symlink hacks in most Lin
 impcurl-ws (async tokio client)
   └── impcurl (safe blocking wrapper)
        └── impcurl-sys (dynamic FFI + auto-fetch)
-            └── libcurl-impersonate (runtime .so/.dylib/.dll)
+            └── libcurl-impersonate (.so/.dylib/.dll)
 ```
 
 On Unix, the async event loop uses `CURLMOPT_SOCKETFUNCTION` / `CURLMOPT_TIMERFUNCTION` with `tokio::io::unix::AsyncFd` for efficient socket-level readiness notification. Non-Unix falls back to `curl_multi_poll`.
@@ -121,18 +119,22 @@ MIT
 
 ## Runtime Asset Release
 
-This repository includes a workflow that publishes versioned runtime assets:
+This repository includes a workflow that publishes versioned libcurl-impersonate assets:
 
-- GitHub Actions workflow: `.github/workflows/release-runtime-assets.yml`
-- Local packaging helper: `scripts/package_runtime_assets.sh`
+- GitHub Actions workflow: `.github/workflows/release-libcurl-impersonate-assets.yml`
+- Local packaging helper: `scripts/package_libcurl_assets.sh`
 
 Asset naming:
 
-- `impcurl-runtime-v<version>-x86_64-unknown-linux-gnu.tar.gz`
-- `impcurl-runtime-v<version>-aarch64-unknown-linux-gnu.tar.gz`
-- `impcurl-runtime-v<version>-x86_64-unknown-linux-gnu.sha256`
-- `impcurl-runtime-v<version>-aarch64-unknown-linux-gnu.sha256`
+- `impcurl-libcurl-impersonate-v<version>-x86_64-apple-darwin.tar.gz`
+- `impcurl-libcurl-impersonate-v<version>-aarch64-apple-darwin.tar.gz`
+- `impcurl-libcurl-impersonate-v<version>-x86_64-unknown-linux-gnu.tar.gz`
+- `impcurl-libcurl-impersonate-v<version>-aarch64-unknown-linux-gnu.tar.gz`
+- `impcurl-libcurl-impersonate-v<version>-x86_64-apple-darwin.sha256`
+- `impcurl-libcurl-impersonate-v<version>-aarch64-apple-darwin.sha256`
+- `impcurl-libcurl-impersonate-v<version>-x86_64-unknown-linux-gnu.sha256`
+- `impcurl-libcurl-impersonate-v<version>-aarch64-unknown-linux-gnu.sha256`
 
-Note: `aarch64` publishing depends on an available ARM64 source image for
-`libcurl-impersonate`. The workflow has an explicit ARM64 image input so the
-asset can be enabled once that source is available.
+Note: Linux `aarch64` publishing depends on an available ARM64 source image for
+`libcurl-impersonate`. macOS assets are packaged by extracting standalone
+`.dylib` files from `curl-cffi` wheels during the release workflow.
