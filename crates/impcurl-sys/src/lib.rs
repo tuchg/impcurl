@@ -103,6 +103,7 @@ pub const CURLOPT_HTTP_VERSION: CurlOption = 84;
 pub const CURLOPT_CONNECT_ONLY: CurlOption = 141;
 pub const CURLOPT_VERBOSE: CurlOption = 41;
 pub const CURLOPT_PROXY: CurlOption = 10004;
+pub const CURLOPT_CAINFO: CurlOption = 10065;
 pub const CURLINFO_RESPONSE_CODE: c_uint = 0x200002;
 
 pub const CURL_HTTP_VERSION_1_1: c_long = 2;
@@ -527,6 +528,49 @@ fn default_runtime_search_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// Resolve a usable CA bundle file path for TLS verification.
+///
+/// Resolution order:
+/// 1. `CURL_CA_BUNDLE`
+/// 2. `SSL_CERT_FILE`
+/// 3. platform defaults (`/etc/ssl/certs/ca-certificates.crt` first on Linux)
+pub fn resolve_ca_bundle_path() -> Option<PathBuf> {
+    for key in ["CURL_CA_BUNDLE", "SSL_CERT_FILE"] {
+        if let Ok(value) = std::env::var(key) {
+            let candidate = PathBuf::from(value);
+            if candidate.is_file() {
+                debug!(path = %candidate.display(), env = key, "resolved CA bundle from env");
+                return Some(candidate);
+            }
+        }
+    }
+
+    for candidate in default_ca_bundle_candidates() {
+        if candidate.is_file() {
+            debug!(path = %candidate.display(), "resolved CA bundle from platform defaults");
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+fn default_ca_bundle_candidates() -> Vec<PathBuf> {
+    if cfg!(target_os = "linux") {
+        vec![
+            PathBuf::from("/etc/ssl/certs/ca-certificates.crt"),
+            PathBuf::from("/etc/pki/tls/certs/ca-bundle.crt"),
+            PathBuf::from("/etc/ssl/cert.pem"),
+            PathBuf::from("/etc/pki/tls/cert.pem"),
+            PathBuf::from("/etc/ssl/ca-bundle.pem"),
+        ]
+    } else if cfg!(target_os = "macos") {
+        vec![PathBuf::from("/etc/ssl/cert.pem")]
+    } else {
+        Vec::new()
+    }
+}
+
 fn auto_fetch_enabled() -> bool {
     match std::env::var("IMPCURL_AUTO_FETCH") {
         Ok(value) => {
@@ -842,7 +886,8 @@ pub fn resolve_impersonate_lib_path(extra_search_roots: &[PathBuf]) -> Result<Pa
 
 #[cfg(test)]
 mod tests {
-    use super::select_curl_cffi_wheel_download_url;
+    use super::{resolve_ca_bundle_path, select_curl_cffi_wheel_download_url};
+    use std::{env, ffi::OsString};
 
     #[test]
     fn picks_matching_wheel_asset_url() {
@@ -865,5 +910,44 @@ mod tests {
             .expect("expected matching wheel URL");
 
         assert_eq!(url, "https://example.test/arm64.whl");
+    }
+
+    #[test]
+    fn prefers_curl_ca_bundle_env_when_file_exists() {
+        let fixture = env::current_exe().expect("current executable path should exist");
+        let _guard_ssl = EnvGuard::set("SSL_CERT_FILE", None);
+        let _guard_curl = EnvGuard::set("CURL_CA_BUNDLE", Some(fixture.as_os_str()));
+
+        let resolved = resolve_ca_bundle_path().expect("expected env CA bundle to resolve");
+        assert_eq!(resolved, fixture);
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, new: Option<&std::ffi::OsStr>) -> Self {
+            let old = env::var_os(key);
+            unsafe {
+                match new {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.old.as_ref() {
+                    Some(value) => env::set_var(self.key, value),
+                    None => env::remove_var(self.key),
+                }
+            }
+        }
     }
 }

@@ -21,7 +21,7 @@ Bypass TLS fingerprinting by impersonating real browser signatures (Chrome, Safa
 
 ```toml
 [dependencies]
-impcurl-ws = "0.2"
+impcurl-ws = "1.0.1"
 futures-util = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -81,6 +81,17 @@ The `libcurl-impersonate` shared library is resolved at runtime in this order:
 
 `impcurl-ws` does not expose a `lib_path(...)` builder escape hatch anymore. Runtime library resolution is treated as deployment/runtime configuration rather than a connection-level concern.
 
+## TLS CA Bundle (Linux)
+
+`impcurl` now auto-resolves a CA bundle and applies `CURLOPT_CAINFO` during websocket setup.
+Resolution order:
+
+1. `CURL_CA_BUNDLE`
+2. `SSL_CERT_FILE`
+3. Platform defaults (Linux: `/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`, ...)
+
+This removes the need for app-level distro-specific CA symlink hacks in most Linux deployments.
+
 ### Auto-fetch Controls
 
 | Env Var | Description |
@@ -88,6 +99,7 @@ The `libcurl-impersonate` shared library is resolved at runtime in this order:
 | `IMPCURL_AUTO_FETCH=0` | Disable auto-download |
 | `IMPCURL_CURL_CFFI_VERSION` | curl_cffi release tag (default `0.11.3`) |
 | `IMPCURL_AUTO_FETCH_CACHE_DIR` | Override fetch cache directory |
+| `IMPCURL_DISABLE_AUTO_CAINFO=1` | Disable automatic `CURLOPT_CAINFO` injection |
 
 ## Architecture
 

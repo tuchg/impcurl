@@ -1,10 +1,9 @@
 use impcurl_sys::{
-    CURL_GLOBAL_DEFAULT, CURL_SOCKET_TIMEOUT, CURLE_AGAIN, CURLE_OK,
-    CURLINFO_RESPONSE_CODE, CURLM_OK, CURLMOPT_SOCKETDATA, CURLMOPT_SOCKETFUNCTION,
-    CURLMOPT_TIMERDATA, CURLMOPT_TIMERFUNCTION, CURLMSG_DONE, CURLOPT_CONNECT_ONLY,
-    CURLOPT_HTTPHEADER, CURLOPT_PROXY, CURLOPT_URL, CURLOPT_VERBOSE, Curl,
-    CurlApi, CurlCode, CurlMCode, CurlMulti, CurlMultiSocketCallback, CurlMultiTimerCallback,
-    CurlOption, CurlSlist, CurlWsFrame,
+    CURL_GLOBAL_DEFAULT, CURL_SOCKET_TIMEOUT, CURLE_AGAIN, CURLE_OK, CURLINFO_RESPONSE_CODE,
+    CURLM_OK, CURLMOPT_SOCKETDATA, CURLMOPT_SOCKETFUNCTION, CURLMOPT_TIMERDATA,
+    CURLMOPT_TIMERFUNCTION, CURLMSG_DONE, CURLOPT_CAINFO, CURLOPT_CONNECT_ONLY, CURLOPT_HTTPHEADER,
+    CURLOPT_PROXY, CURLOPT_URL, CURLOPT_VERBOSE, Curl, CurlApi, CurlCode, CurlMCode, CurlMulti,
+    CurlMultiSocketCallback, CurlMultiTimerCallback, CurlOption, CurlSlist, CurlWsFrame,
 };
 use std::ffi::CString;
 use std::mem::MaybeUninit;
@@ -12,7 +11,7 @@ use std::os::raw::{c_char, c_int, c_long, c_uint, c_void};
 use std::ptr;
 use std::sync::OnceLock;
 use std::time::Duration;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImpcurlError {
@@ -416,6 +415,7 @@ fn configure_connect_only_websocket_session(
                     "CURLOPT_PROXY",
                 )?;
             }
+            maybe_configure_cainfo(api, session.easy_handle());
         }
     }
 
@@ -437,6 +437,40 @@ fn configure_connect_only_websocket_session(
     }
 
     Ok(())
+}
+
+fn maybe_configure_cainfo(api: &CurlApi, easy: *mut Curl) {
+    if let Ok(value) = std::env::var("IMPCURL_DISABLE_AUTO_CAINFO") {
+        let normalized = value.trim().to_ascii_lowercase();
+        if matches!(normalized.as_str(), "1" | "true" | "yes" | "on") {
+            return;
+        }
+    }
+
+    let Some(path) = impcurl_sys::resolve_ca_bundle_path() else {
+        return;
+    };
+
+    let path_text = path.to_string_lossy().into_owned();
+    let c_path = match CString::new(path_text.clone()) {
+        Ok(value) => value,
+        Err(err) => {
+            warn!(path = %path.display(), error = %err, "ignoring CA bundle path with NUL byte");
+            return;
+        }
+    };
+
+    let result =
+        unsafe { setopt_cstr(api, easy, CURLOPT_CAINFO, c_path.as_ptr(), "CURLOPT_CAINFO") };
+    if let Err(err) = result {
+        warn!(
+            path = %path.display(),
+            error = %err,
+            "failed to apply resolved CA bundle path"
+        );
+    } else {
+        debug!(path = %path.display(), "configured CURLOPT_CAINFO from resolved CA bundle");
+    }
 }
 
 pub fn prepare_connect_only_websocket_session<'a>(
