@@ -1,10 +1,10 @@
 use impcurl_sys::{
     CURL_GLOBAL_DEFAULT, CURL_HTTP_VERSION_1_1, CURL_SOCKET_TIMEOUT, CURLE_AGAIN, CURLE_OK,
-    CURLM_OK, CURLMOPT_SOCKETDATA, CURLMOPT_SOCKETFUNCTION, CURLMOPT_TIMERDATA,
-    CURLMOPT_TIMERFUNCTION, CURLMSG_DONE, CURLOPT_CONNECT_ONLY, CURLOPT_HTTP_VERSION,
-    CURLOPT_HTTPHEADER, CURLOPT_PROXY, CURLOPT_URL, CURLOPT_VERBOSE, Curl, CurlApi,
-    CurlCode, CurlMCode, CurlMulti, CurlMultiSocketCallback, CurlMultiTimerCallback, CurlOption,
-    CurlSlist, CurlWsFrame,
+    CURLINFO_RESPONSE_CODE, CURLM_OK, CURLMOPT_SOCKETDATA, CURLMOPT_SOCKETFUNCTION,
+    CURLMOPT_TIMERDATA, CURLMOPT_TIMERFUNCTION, CURLMSG_DONE, CURLOPT_CONNECT_ONLY,
+    CURLOPT_HTTP_VERSION, CURLOPT_HTTPHEADER, CURLOPT_PROXY, CURLOPT_URL, CURLOPT_VERBOSE, Curl,
+    CurlApi, CurlCode, CurlMCode, CurlMulti, CurlMultiSocketCallback, CurlMultiTimerCallback,
+    CurlOption, CurlSlist, CurlWsFrame,
 };
 use std::ffi::CString;
 use std::mem::MaybeUninit;
@@ -450,7 +450,11 @@ pub fn prepare_connect_only_websocket_session<'a>(
     api: &'a CurlApi,
     cfg: &WebSocketConnectConfig<'_>,
 ) -> Result<EasySession<'a>> {
-    debug!(url = cfg.url, impersonate = cfg.impersonate_target.as_str(), "preparing websocket session");
+    debug!(
+        url = cfg.url,
+        impersonate = cfg.impersonate_target.as_str(),
+        "preparing websocket session"
+    );
     let mut session = EasySession::new(api)?;
     configure_connect_only_websocket_session(&mut session, cfg)?;
     Ok(session)
@@ -469,11 +473,19 @@ pub fn complete_connect_only_websocket_handshake_with_multi(
 
     loop {
         if let Some(done_code) = multi.read_done_message_for_easy(easy) {
-            check_code(
-                api,
-                done_code,
-                "curl_multi_socket_action websocket handshake",
-            )?;
+            if done_code != CURLE_OK {
+                let mut message = api.error_text(done_code);
+                if let Ok(status_code) = easy_response_status_code(api, easy) {
+                    if status_code > 0 {
+                        message = format!("{message}; HTTP status code: {status_code}");
+                    }
+                }
+                return Err(ImpcurlError::Curl {
+                    step: "curl_multi_socket_action websocket handshake".to_owned(),
+                    message,
+                    code: done_code,
+                });
+            }
             debug!("websocket handshake complete");
             return Ok(());
         }
@@ -486,6 +498,13 @@ pub fn complete_connect_only_websocket_handshake_with_multi(
         multi.socket_action_timeout(&mut running_handles)?;
         multi.perform(&mut running_handles)?;
     }
+}
+
+fn easy_response_status_code(api: &CurlApi, easy: *mut Curl) -> Result<c_long> {
+    let mut code: c_long = 0;
+    let rc = unsafe { (api.easy_getinfo)(easy, CURLINFO_RESPONSE_CODE, &mut code) };
+    check_code(api, rc, "curl_easy_getinfo(CURLINFO_RESPONSE_CODE)")?;
+    Ok(code)
 }
 
 pub fn detach_easy_from_multi(multi: &MultiSession<'_>, easy: *mut Curl) -> Result<()> {
@@ -578,7 +597,8 @@ pub fn ws_try_recv_frame(
     assembler: &mut WsFrameAssembler,
 ) -> Result<Option<WsFrame>> {
     loop {
-        let mut recv_buf: [MaybeUninit<u8>; 16 * 1024] = unsafe { MaybeUninit::uninit().assume_init() };
+        let mut recv_buf: [MaybeUninit<u8>; 16 * 1024] =
+            unsafe { MaybeUninit::uninit().assume_init() };
         let mut received = 0usize;
         let mut meta_ptr: *const CurlWsFrame = ptr::null();
 
@@ -604,7 +624,9 @@ pub fn ws_try_recv_frame(
             });
         }
 
-        let received_bytes = unsafe { &*(recv_buf.get_unchecked(..received) as *const [MaybeUninit<u8>] as *const [u8]) };
+        let received_bytes = unsafe {
+            &*(recv_buf.get_unchecked(..received) as *const [MaybeUninit<u8>] as *const [u8])
+        };
 
         if !meta_ptr.is_null() {
             let meta = unsafe { &*meta_ptr };
@@ -624,7 +646,10 @@ pub fn ws_try_recv_frame(
             if meta.bytesleft == 0 {
                 assembler.started = false;
                 let flags = assembler.frame_flags;
-                let payload = std::mem::replace(&mut assembler.complete, std::mem::take(&mut assembler.spare));
+                let payload = std::mem::replace(
+                    &mut assembler.complete,
+                    std::mem::take(&mut assembler.spare),
+                );
                 trace!(len = payload.len(), flags, "ws frame assembled");
                 return Ok(Some(WsFrame { flags, payload }));
             }
@@ -636,7 +661,10 @@ pub fn ws_try_recv_frame(
                 assembler.complete.extend_from_slice(received_bytes);
                 assembler.started = false;
                 let flags = assembler.frame_flags;
-                let payload = std::mem::replace(&mut assembler.complete, std::mem::take(&mut assembler.spare));
+                let payload = std::mem::replace(
+                    &mut assembler.complete,
+                    std::mem::take(&mut assembler.spare),
+                );
                 return Ok(Some(WsFrame { flags, payload }));
             }
             return Ok(Some(WsFrame {
@@ -650,16 +678,8 @@ pub fn ws_try_recv_frame(
 /// Single-attempt ws_send. Returns bytes sent, or CURLE_AGAIN error if socket not ready.
 pub fn ws_send(api: &CurlApi, easy: *mut Curl, data: &[u8], flags: c_uint) -> Result<usize> {
     let mut sent = 0usize;
-    let code = unsafe {
-        (api.ws_send)(
-            easy,
-            data.as_ptr().cast(),
-            data.len(),
-            &mut sent,
-            0,
-            flags,
-        )
-    };
+    let code =
+        unsafe { (api.ws_send)(easy, data.as_ptr().cast(), data.len(), &mut sent, 0, flags) };
     if code == CURLE_OK {
         if sent == 0 {
             return Err(ImpcurlError::SendZeroBytes);

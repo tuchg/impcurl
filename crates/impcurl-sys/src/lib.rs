@@ -1,5 +1,4 @@
 use libloading::Library;
-use tracing::{debug, info};
 use serde_json::Value;
 use std::ffi::CStr;
 use std::fs::{self, File};
@@ -9,6 +8,7 @@ use std::os::raw::{c_char, c_int, c_long, c_short, c_uint, c_ulong, c_void};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
+use tracing::{debug, info};
 use zip::ZipArchive;
 
 pub type CurlCode = c_int;
@@ -103,6 +103,7 @@ pub const CURLOPT_HTTP_VERSION: CurlOption = 84;
 pub const CURLOPT_CONNECT_ONLY: CurlOption = 141;
 pub const CURLOPT_VERBOSE: CurlOption = 41;
 pub const CURLOPT_PROXY: CurlOption = 10004;
+pub const CURLINFO_RESPONSE_CODE: c_uint = 0x200002;
 
 pub const CURL_HTTP_VERSION_1_1: c_long = 2;
 pub const CURLWS_TEXT: c_uint = 1;
@@ -171,6 +172,7 @@ pub struct CurlApi {
     pub easy_cleanup: unsafe extern "C" fn(*mut Curl),
     pub easy_perform: unsafe extern "C" fn(*mut Curl) -> CurlCode,
     pub easy_setopt: unsafe extern "C" fn(*mut Curl, CurlOption, ...) -> CurlCode,
+    pub easy_getinfo: unsafe extern "C" fn(*mut Curl, c_uint, ...) -> CurlCode,
     pub easy_strerror: unsafe extern "C" fn(CurlCode) -> *const c_char,
     pub easy_impersonate: unsafe extern "C" fn(*mut Curl, *const c_char, c_int) -> CurlCode,
     pub slist_append: unsafe extern "C" fn(*mut CurlSlist, *const c_char) -> *mut CurlSlist,
@@ -242,6 +244,12 @@ impl CurlApi {
             load_symbol::<unsafe extern "C" fn(*mut Curl, CurlOption, ...) -> CurlCode>(
                 &lib,
                 b"curl_easy_setopt\0",
+            )?
+        };
+        let easy_getinfo = unsafe {
+            load_symbol::<unsafe extern "C" fn(*mut Curl, c_uint, ...) -> CurlCode>(
+                &lib,
+                b"curl_easy_getinfo\0",
             )?
         };
         let easy_strerror = unsafe {
@@ -376,6 +384,7 @@ impl CurlApi {
             easy_cleanup,
             easy_perform,
             easy_setopt,
+            easy_getinfo,
             easy_strerror,
             easy_impersonate,
             slist_append,
