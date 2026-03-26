@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUT_DIR="${ROOT_DIR}/dist/runtime-assets"
+VERSION="${1:-}"
+TARGET="${2:-x86_64-unknown-linux-gnu}"
+
+if [[ -z "${VERSION}" ]]; then
+  echo "usage: $0 <version> [target]" >&2
+  exit 1
+fi
+
+CURL_IMPERSONATE_IMAGE="${CURL_IMPERSONATE_IMAGE:-lexiforest/curl-impersonate:v1.5.1@sha256:0e43f7ef4007ce957fcd6532f4295d0193f9178f4e6eccb1a6f754d64f7f9fcd}"
+ASSET_BASE="impcurl-runtime-v${VERSION}-${TARGET}"
+ASSET_DIR="${OUT_DIR}/${ASSET_BASE}"
+ASSET_TGZ="${OUT_DIR}/${ASSET_BASE}.tar.gz"
+
+mkdir -p "${ASSET_DIR}"
+
+container_id="$(docker create --platform=linux/amd64 "${CURL_IMPERSONATE_IMAGE}" true)"
+cleanup() {
+  docker rm -f "${container_id}" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+docker cp "${container_id}:/usr/local/lib/libcurl-impersonate.so.4" "${ASSET_DIR}/libcurl-impersonate.so.4"
+docker cp "${container_id}:/usr/local/lib/libcurl-impersonate.so" "${ASSET_DIR}/libcurl-impersonate.so"
+
+tar -czf "${ASSET_TGZ}" -C "${ASSET_DIR}" .
+(cd "${OUT_DIR}" && shasum -a 256 "$(basename "${ASSET_TGZ}")" > "${ASSET_BASE}.sha256")
+
+echo "packaged: ${ASSET_TGZ}"
+echo "checksum: ${OUT_DIR}/${ASSET_BASE}.sha256"

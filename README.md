@@ -21,7 +21,7 @@ Bypass TLS fingerprinting by impersonating real browser signatures (Chrome, Safa
 
 ```toml
 [dependencies]
-impcurl-ws = "1.0.1"
+impcurl-ws = "1.1.0"
 futures-util = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -77,7 +77,8 @@ The `libcurl-impersonate` shared library is resolved at runtime in this order:
 2. Near executable (`../lib/` and side-by-side)
 3. `IMPCURL_LIB_DIR` env var
 4. `~/.impcurl/lib`, `~/.cuimp/binaries`
-5. Auto-fetch from [curl_cffi](https://github.com/lexiforest/curl_cffi) wheel (enabled by default)
+5. Auto-fetch from versioned runtime assets on this repo's GitHub Releases (enabled by default)
+6. Fallback auto-fetch from [curl_cffi](https://github.com/lexiforest/curl_cffi) wheel
 
 `impcurl-ws` does not expose a `lib_path(...)` builder escape hatch anymore. Runtime library resolution is treated as deployment/runtime configuration rather than a connection-level concern.
 
@@ -97,6 +98,8 @@ This removes the need for app-level distro-specific CA symlink hacks in most Lin
 | Env Var | Description |
 |---------|-------------|
 | `IMPCURL_AUTO_FETCH=0` | Disable auto-download |
+| `IMPCURL_RUNTIME_VERSION` | Runtime asset version (default current crate version) |
+| `IMPCURL_RUNTIME_REPO` | GitHub repo for runtime assets (default `tuchg/impcurl`) |
 | `IMPCURL_CURL_CFFI_VERSION` | curl_cffi release tag (default `0.11.3`) |
 | `IMPCURL_AUTO_FETCH_CACHE_DIR` | Override fetch cache directory |
 | `IMPCURL_DISABLE_AUTO_CAINFO=1` | Disable automatic `CURLOPT_CAINFO` injection |
@@ -115,3 +118,15 @@ On Unix, the async event loop uses `CURLMOPT_SOCKETFUNCTION` / `CURLMOPT_TIMERFU
 ## License
 
 MIT
+
+## Runtime Asset Release
+
+This repository includes a workflow that publishes versioned runtime assets:
+
+- GitHub Actions workflow: `.github/workflows/release-runtime-assets.yml`
+- Local packaging helper: `scripts/package_runtime_assets.sh`
+
+Asset naming:
+
+- `impcurl-runtime-v<version>-x86_64-unknown-linux-gnu.tar.gz`
+- `impcurl-runtime-v<version>-x86_64-unknown-linux-gnu.sha256`

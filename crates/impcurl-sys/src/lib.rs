@@ -161,6 +161,16 @@ pub enum SysError {
         "wheel extracted shared objects into {cache_dir}, but no standalone libcurl-impersonate runtime was found"
     )]
     AutoFetchNoStandaloneRuntime { cache_dir: PathBuf },
+    #[error(
+        "no standalone libcurl-impersonate runtime found in {cache_dir}; runtime-asset fetch: {runtime_error}; curl_cffi fetch: {cffi_error}"
+    )]
+    AutoFetchNoStandaloneRuntimeWithReasons {
+        cache_dir: PathBuf,
+        runtime_error: String,
+        cffi_error: String,
+    },
+    #[error("no runtime asset naming rule for target: {0}")]
+    AutoFetchRuntimeUnsupportedTarget(String),
 }
 
 pub struct CurlApi {
@@ -656,6 +666,41 @@ fn wheel_platform_tag_for_target(target: &str) -> Option<&'static str> {
     }
 }
 
+fn runtime_asset_target_for_triple(target: &str) -> Option<&'static str> {
+    match target {
+        "x86_64-unknown-linux-gnu" => Some("x86_64-unknown-linux-gnu"),
+        "aarch64-unknown-linux-gnu" => Some("aarch64-unknown-linux-gnu"),
+        "x86_64-unknown-linux-musl" => Some("x86_64-unknown-linux-musl"),
+        "aarch64-unknown-linux-musl" => Some("aarch64-unknown-linux-musl"),
+        _ => None,
+    }
+}
+
+fn runtime_version() -> String {
+    std::env::var("IMPCURL_RUNTIME_VERSION")
+        .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_owned())
+}
+
+fn runtime_repo() -> String {
+    std::env::var("IMPCURL_RUNTIME_REPO").unwrap_or_else(|_| "tuchg/impcurl".to_owned())
+}
+
+fn runtime_release_tag(version: &str) -> String {
+    format!("impcurl-runtime-v{version}")
+}
+
+fn runtime_asset_name(version: &str, target: &str) -> String {
+    format!("impcurl-runtime-v{version}-{target}.tar.gz")
+}
+
+fn runtime_cache_dir(base: &Path, version: &str, target: &str) -> PathBuf {
+    base.join("runtime").join(version).join(target)
+}
+
+fn runtime_asset_url(repo: &str, tag: &str, asset_name: &str) -> String {
+    format!("https://github.com/{repo}/releases/download/{tag}/{asset_name}")
+}
+
 fn is_shared_library_name(file_name: &str) -> bool {
     if cfg!(target_os = "macos") {
         file_name.ends_with(".dylib")
@@ -737,6 +782,52 @@ fn fetch_url_to_file(url: &str, output_path: &Path) -> Result<(), SysError> {
     wget_cmd.arg("-O").arg(&output_str).arg(url);
     run_download_command(&mut wget_cmd, "wget")?;
     Ok(())
+}
+
+fn extract_tar_gz_archive(archive_path: &Path, output_dir: &Path) -> Result<(), SysError> {
+    fs::create_dir_all(output_dir)?;
+    let mut tar_cmd = Command::new("tar");
+    tar_cmd
+        .arg("-xzf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(output_dir);
+    let _ = run_download_command(&mut tar_cmd, "tar")?;
+    Ok(())
+}
+
+fn auto_fetch_from_runtime_assets(cache_dir: &Path) -> Result<PathBuf, SysError> {
+    let version = runtime_version();
+    let target_triple = current_target_triple().to_owned();
+    let target = runtime_asset_target_for_triple(&target_triple)
+        .ok_or_else(|| SysError::AutoFetchRuntimeUnsupportedTarget(target_triple.clone()))?;
+    let repo = runtime_repo();
+    let tag = runtime_release_tag(&version);
+    let asset = runtime_asset_name(&version, target);
+    let url = runtime_asset_url(&repo, &tag, &asset);
+    let output_dir = runtime_cache_dir(cache_dir, &version, target);
+    let archive_path = cache_dir.join(format!(
+        ".runtime-{version}-{target}-{}.tar.gz",
+        std::process::id()
+    ));
+
+    info!(
+        cache_dir = %cache_dir.display(),
+        output_dir = %output_dir.display(),
+        url = %url,
+        "auto-fetching runtime library from versioned release asset"
+    );
+
+    fetch_url_to_file(&url, &archive_path)?;
+    extract_tar_gz_archive(&archive_path, &output_dir)?;
+    let _ = fs::remove_file(&archive_path);
+
+    let mut searched = Vec::new();
+    probe_library_dir(&output_dir, &mut searched).ok_or_else(|| {
+        SysError::AutoFetchNoStandaloneRuntime {
+            cache_dir: output_dir.clone(),
+        }
+    })
 }
 
 fn select_curl_cffi_wheel_download_url(
@@ -861,13 +952,41 @@ pub fn resolve_impersonate_lib_path(extra_search_roots: &[PathBuf]) -> Result<Pa
     if auto_fetch_enabled() {
         let auto_fetch_result = (|| -> Result<PathBuf, SysError> {
             let cache_dir = auto_fetch_cache_dir()?;
+            let target_triple = current_target_triple().to_owned();
+            let target = runtime_asset_target_for_triple(&target_triple).ok_or_else(|| {
+                SysError::AutoFetchRuntimeUnsupportedTarget(target_triple.clone())
+            })?;
+            let version = runtime_version();
+            let runtime_dir = runtime_cache_dir(&cache_dir, &version, target);
+            if let Some(found) = probe_library_dir(&runtime_dir, &mut searched) {
+                return Ok(found);
+            }
             if let Some(found) = probe_library_dir(&cache_dir, &mut searched) {
                 return Ok(found);
             }
-            auto_fetch_from_curl_cffi(&cache_dir)?;
+
+            let runtime_fetch_err = auto_fetch_from_runtime_assets(&cache_dir).err();
+            if let Some(found) = probe_library_dir(&runtime_dir, &mut searched) {
+                return Ok(found);
+            }
+            if let Some(found) = probe_library_dir(&cache_dir, &mut searched) {
+                return Ok(found);
+            }
+
+            let cffi_fetch_err = auto_fetch_from_curl_cffi(&cache_dir).err();
             probe_library_dir(&cache_dir, &mut searched).ok_or_else(|| {
-                SysError::AutoFetchNoStandaloneRuntime {
+                let runtime_text = runtime_fetch_err
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "not attempted".to_owned());
+                let cffi_text = cffi_fetch_err
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "not attempted".to_owned());
+                SysError::AutoFetchNoStandaloneRuntimeWithReasons {
                     cache_dir: cache_dir.to_path_buf(),
+                    runtime_error: runtime_text,
+                    cffi_error: cffi_text,
                 }
             })
         })();
@@ -886,7 +1005,10 @@ pub fn resolve_impersonate_lib_path(extra_search_roots: &[PathBuf]) -> Result<Pa
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_ca_bundle_path, select_curl_cffi_wheel_download_url};
+    use super::{
+        resolve_ca_bundle_path, runtime_asset_name, runtime_release_tag,
+        select_curl_cffi_wheel_download_url,
+    };
     use std::{env, ffi::OsString};
 
     #[test]
@@ -920,6 +1042,15 @@ mod tests {
 
         let resolved = resolve_ca_bundle_path().expect("expected env CA bundle to resolve");
         assert_eq!(resolved, fixture);
+    }
+
+    #[test]
+    fn runtime_asset_naming_is_versioned() {
+        assert_eq!(runtime_release_tag("1.2.3"), "impcurl-runtime-v1.2.3");
+        assert_eq!(
+            runtime_asset_name("1.2.3", "x86_64-unknown-linux-gnu"),
+            "impcurl-runtime-v1.2.3-x86_64-unknown-linux-gnu.tar.gz"
+        );
     }
 
     struct EnvGuard {
